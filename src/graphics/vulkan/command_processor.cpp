@@ -53,6 +53,9 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_STRING(gpu_log_shader_draws, "", "GPU",
+                      "Diagnostic: comma-separated pixel shader ucode hashes (hex, as in shader "
+                      "dumps) whose draws log their float constants c0-c3 and texture fetches");
 REXCVAR_DEFINE_BOOL(gpu_gamma_ramp_bypass, false, "GPU",
                     "Diagnostic: present through a straight-line gamma ramp instead of the "
                     "guest's (the guest's ramp is still logged)");
@@ -4462,6 +4465,58 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!memexport_used_vertex) {
       // This draw has no effect.
       return true;
+    }
+  }
+  // Diagnostic (gpu_log_shader_draws): for draws whose pixel shader hash is
+  // listed, log its first float constants and its texture fetch constants, to
+  // compare one draw's inputs against a working build.
+  if (pixel_shader && !REXCVAR_GET(gpu_log_shader_draws).empty()) {
+    static std::vector<uint64_t> logged_hashes;
+    static std::vector<uint32_t> logged_counts;
+    static std::string parsed_spec;
+    const std::string& spec = REXCVAR_GET(gpu_log_shader_draws);
+    if (spec != parsed_spec) {
+      parsed_spec = spec;
+      logged_hashes.clear();
+      logged_counts.clear();
+      size_t pos = 0;
+      while (pos < spec.size()) {
+        size_t end = spec.find(',', pos);
+        if (end == std::string::npos) end = spec.size();
+        std::string item = spec.substr(pos, end - pos);
+        if (!item.empty()) {
+          logged_hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+          logged_counts.push_back(0);
+        }
+        pos = end + 1;
+      }
+    }
+    const uint64_t hash = pixel_shader->ucode_data_hash();
+    for (size_t h = 0; h < logged_hashes.size(); ++h) {
+      if (logged_hashes[h] != hash) continue;
+      uint32_t n = logged_counts[h]++;
+      // The first 4 draws, then every 300th, up to 40 reports.
+      if (n >= 4 && (n % 300 != 0 || n / 300 > 36)) break;
+      auto c = [&](uint32_t i, uint32_t comp) {
+        return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + comp);
+      };
+      REXGPU_INFO(
+          "ShaderDraw PS {:016X} #{}: c0=({:g},{:g},{:g},{:g}) c1=({:g},{:g},{:g},{:g}) "
+          "c2=({:g},{:g},{:g},{:g}) c3=({:g},{:g},{:g},{:g})",
+          hash, n, c(0, 0), c(0, 1), c(0, 2), c(0, 3), c(1, 0), c(1, 1), c(1, 2), c(1, 3), c(2, 0),
+          c(2, 1), c(2, 2), c(2, 3), c(3, 0), c(3, 1), c(3, 2), c(3, 3));
+      for (uint32_t t = 0; t < 5; ++t) {
+        xenos::xe_gpu_texture_fetch_t f = regs.GetTextureFetch(t);
+        if (!f.base_address) continue;
+        REXGPU_INFO(
+            "ShaderDraw PS {:016X} #{}: tf{} format={} sign={}{}{}{} num_format={} exp_adjust={} "
+            "{}x{} base=0x{:08X} swizzle=0x{:03X} tiled={}",
+            hash, n, t, uint32_t(f.format), uint32_t(f.sign_x), uint32_t(f.sign_y),
+            uint32_t(f.sign_z), uint32_t(f.sign_w), uint32_t(f.num_format), int32_t(f.exp_adjust),
+            uint32_t(f.size_2d.width) + 1, uint32_t(f.size_2d.height) + 1,
+            uint32_t(f.base_address) << 12, uint32_t(f.swizzle), uint32_t(f.tiled));
+      }
+      break;
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
