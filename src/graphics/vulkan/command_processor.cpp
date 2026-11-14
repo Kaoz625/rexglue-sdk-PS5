@@ -53,6 +53,9 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(gpu_gamma_ramp_bypass, false, "GPU",
+                    "Diagnostic: present through a straight-line gamma ramp instead of the "
+                    "guest's (the guest's ramp is still logged)");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2795,6 +2798,53 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                         use_pwl_gamma_ramp ? static_cast<const void*>(gamma_ramp_pwl_rgb())
                                            : static_cast<const void*>(gamma_ramp_256_entry_table()),
                         gamma_ramp_size);
+          }
+          // Diagnostics for a too-dark picture: what ramp the guest set, and
+          // optionally present through a straight-line ramp instead.
+          {
+            static uint32_t ramp_logs = 0;
+            if (ramp_logs < 16) {
+              ++ramp_logs;
+              if (use_pwl_gamma_ramp) {
+                const reg::DC_LUT_PWL_DATA* pwl = gamma_ramp_pwl_rgb();
+                auto e = [&](uint32_t i) { return pwl[i * 3]; };  // red channel
+                REXGPU_INFO(
+                    "Gamma ramp (PWL, frontbuffer {}): red base/delta [0] {:04X}/{:04X} "
+                    "[32] {:04X}/{:04X} [64] {:04X}/{:04X} [96] {:04X}/{:04X} [127] {:04X}/{:04X}{}",
+                    uint32_t(frontbuffer_format), uint32_t(e(0).base), uint32_t(e(0).delta),
+                    uint32_t(e(32).base), uint32_t(e(32).delta), uint32_t(e(64).base),
+                    uint32_t(e(64).delta), uint32_t(e(96).base), uint32_t(e(96).delta),
+                    uint32_t(e(127).base), uint32_t(e(127).delta),
+                    REXCVAR_GET(gpu_gamma_ramp_bypass) ? " (bypassed)" : "");
+              } else {
+                const reg::DC_LUT_30_COLOR* table = gamma_ramp_256_entry_table();
+                auto r = [&](uint32_t i) { return uint32_t(table[i].color_10_red); };
+                REXGPU_INFO(
+                    "Gamma ramp (256 table, frontbuffer {}): red 10-bit [0] {} [64] {} [128] {} "
+                    "[192] {} [255] {}{}",
+                    uint32_t(frontbuffer_format), r(0), r(64), r(128), r(192), r(255),
+                    REXCVAR_GET(gpu_gamma_ramp_bypass) ? " (bypassed)" : "");
+              }
+            }
+            if (REXCVAR_GET(gpu_gamma_ramp_bypass)) {
+              if (use_pwl_gamma_ramp) {
+                auto* pwl = reinterpret_cast<reg::DC_LUT_PWL_DATA*>(gamma_ramp_frame_upload);
+                for (uint32_t i = 0; i < 128; ++i) {
+                  reg::DC_LUT_PWL_DATA entry = {};
+                  entry.base = (i * 0xFFFF / 0x7F) & ~UINT32_C(0x3F);
+                  entry.delta = i < 0x7F ? 0x200 : 0;
+                  for (uint32_t j = 0; j < 3; ++j) pwl[i * 3 + j] = entry;
+                }
+              } else {
+                auto* table = reinterpret_cast<reg::DC_LUT_30_COLOR*>(gamma_ramp_frame_upload);
+                for (uint32_t i = 0; i < 256; ++i) {
+                  uint32_t value = i * 0x3FF / 0xFF;
+                  table[i].color_10_blue = value;
+                  table[i].color_10_green = value;
+                  table[i].color_10_red = value;
+                }
+              }
+            }
           }
           bool gamma_ramp_has_upload_buffer = gamma_ramp_upload_buffer_memory_ != VK_NULL_HANDLE;
           VkPipelineStageFlags gamma_ramp_read_stage_mask =
