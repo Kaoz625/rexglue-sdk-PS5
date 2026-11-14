@@ -1424,6 +1424,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id fetch_constant_word_4_signed =
             builder_->createUnaryOp(spv::OpBitcast, type_int_, fetch_constant_word_4);
 
+        // Load the fetch constant word 3, for the result exponent bias
+        // (exp_adjust, bits 13:18 - xenos::xe_gpu_texture_fetch_t; word 4 bits
+        // 12:21 are the LOD bias). The DXBC translator reads word 3 too.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_fetch_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
+
         // Accumulate the explicit LOD (or LOD bias) sources (in D3D11.3
         // specification order: specified LOD + sampler LOD bias + instruction
         // LOD bias).
@@ -2029,11 +2045,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
-        // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // Apply the exponent bias (exp_adjust) from the bits 13:18 of the fetch
+        // constant word 3. Reading word 4 here took bits of the LOD bias
+        // instead (usually 0), so a texture with exp_adjust - such as a
+        // k_16_16_16_16 HDR target sampled with exp_adjust 5, i.e. x32 -
+        // came back 2^exp_adjust times too dark (Infinite Undiscovery's tone
+        // mapper).
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;
