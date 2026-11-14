@@ -68,8 +68,14 @@ struct Fiber {
   void (*entry_)(void*) = nullptr;
   void* arg_ = nullptr;
   bool is_thread_fiber_ = false;
+  // The stack is a heap block with nothing below it: a fiber that runs past
+  // its bottom writes into the block beneath, often another fiber's saved
+  // frame. Its lowest bytes hold a pattern, checked when it switches away.
+  bool overflow_reported_ = false;
+  uint32_t id_ = 0;
 
   static void Trampoline();
+  void CheckStack();
 #elif REX_PLATFORM_POSIX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;

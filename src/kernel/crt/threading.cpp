@@ -25,6 +25,14 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/fiber.h>
+#include <rex/cvar.h>
+
+// Host stack per guest fiber (CreateFiber). On the PS5 it is a plain heap
+// block with no guard page, so a fiber that needs more overruns its neighbour
+// (fiber_posix.cpp reports it). Windows fibers grow on demand.
+REXCVAR_DEFINE_INT32(fiber_host_stack_kb, 256, "Kernel",
+                     "Host stack size of each guest fiber, in KiB (at least the guest stack)")
+    .range(64, 16384);
 
 namespace rex::kernel::crt {
 using namespace rex::system;
@@ -232,9 +240,10 @@ u32 CreateFiber_entry(u32 dwStackSize, u32 lpStartAddress, mapped_void lpParamet
   fiber->stack_limit = stack_bottom;
   fiber->sp_save = initial_sp;
 
-  // Create host fiber
-  size_t host_stack =
-      std::max(static_cast<size_t>(guest_stack_size), static_cast<size_t>(256u * 1024u));
+  // Create host fiber. Its host stack runs the recompiled code and every
+  // kernel call the fiber makes, so it is much larger than the guest stack.
+  size_t host_stack = std::max(static_cast<size_t>(guest_stack_size),
+                               static_cast<size_t>(REXCVAR_GET(fiber_host_stack_kb)) * 1024u);
   auto args_owner = std::make_unique<FiberEntryArgs>(FiberEntryArgs{
       start_fn,
       buf_addr,

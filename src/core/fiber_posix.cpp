@@ -25,6 +25,11 @@
 #include <cstdint>
 #include <cstring>
 
+#if REX_PLATFORM_PS5
+#include <atomic>
+#include <rex/logging.h>
+#endif
+
 namespace rex::thread {
 
 thread_local Fiber* Fiber::tls_current_ = nullptr;
@@ -82,12 +87,45 @@ Fiber* Fiber::ConvertCurrentThread() {
   return f;
 }
 
+namespace {
+// The lowest bytes of each fiber stack hold this pattern. If they change, the
+// fiber has run (or come within the guard of) past the bottom of its stack.
+constexpr uint8_t kStackFill = 0xFD;
+constexpr size_t kStackGuardBytes = 4096;  // filled; the bottom 256 are checked each switch
+constexpr size_t kStackCheckBytes = 256;
+std::atomic<uint32_t> next_fiber_id{1};
+}  // namespace
+
+void Fiber::CheckStack() {
+  if (is_thread_fiber_ || overflow_reported_ || stack_.size() < kStackGuardBytes) return;
+  const uint8_t* bottom = stack_.data();
+  bool intact = true;
+  for (size_t i = 0; i < kStackCheckBytes; ++i) {
+    if (bottom[i] != kStackFill) {
+      intact = false;
+      break;
+    }
+  }
+  if (intact) return;
+  overflow_reported_ = true;
+  // How far down it went: the first changed byte of the filled guard.
+  size_t untouched = 0;
+  while (untouched < kStackGuardBytes && bottom[untouched] == kStackFill) ++untouched;
+  REXLOG_ERROR(
+      "Fiber {}: host stack overflow ({} KiB stack, {} bytes of its {}-byte guard untouched): "
+      "it wrote into the heap block below. Raise fiber_host_stack_kb.",
+      id_, stack_.size() / 1024, untouched, kStackGuardBytes);
+  rex::FlushLogging();
+}
+
 Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
   if (stack_size < 64 * 1024) stack_size = 64 * 1024;
   auto* f = new Fiber();
   f->entry_ = entry;
   f->arg_ = arg;
+  f->id_ = next_fiber_id.fetch_add(1, std::memory_order_relaxed);
   f->stack_.resize(stack_size);
+  std::memset(f->stack_.data(), kStackFill, kStackGuardBytes);
 
   // A first frame for rex_ps5_fiber_switch to "return" through into
   // Trampoline. Trampoline then starts with rsp = 8 (mod 16), as after a
@@ -120,6 +158,7 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
 
 void Fiber::SwitchTo(Fiber* target) {
   Fiber* from = tls_current_;
+  from->CheckStack();
   tls_current_ = target;
   rex_ps5_fiber_switch(&from->sp_, target->sp_);
 }
