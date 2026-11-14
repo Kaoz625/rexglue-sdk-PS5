@@ -404,6 +404,12 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
           remaining &= ~(uint64_t(1) << bit);
           if (PageHasRangeWatch((i << 6) + bit)) {
             hot &= ~(uint64_t(1) << bit);
+            // This upload replaces the GPU copy without a new snapshot, so an
+            // older shadow no longer equals the GPU copy. Left in place, a
+            // later request whose bytes match that older content (data that
+            // alternates between two states) would skip its upload and keep
+            // the in-between content: stale vertices (IU title-screen flicker).
+            hot_page_shadows_.erase((i << 6) + bit);
           }
         }
         if (hot) {
