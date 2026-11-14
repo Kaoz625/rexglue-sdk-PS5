@@ -314,8 +314,10 @@ void SwitchToFiber_entry(mapped_void lpFiber) {
   // reused: a crash at a stale return address (Infinite Undiscovery's job
   // fibers do this at the opening credits).
   uint32_t current_addr = static_cast<uint32_t>(kthread->fiber_ptr);
-  if (current_addr == target_addr ||
-      target_info->host_fiber == rex::thread::Fiber::Current()) {
+  // (Compared by guest address: Fiber::Current() reads a thread_local from
+  // another file, whose TLS wrapper a PS5 title cannot import. Fiber::SwitchTo
+  // also ignores a switch to itself.)
+  if (current_addr == target_addr) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
       REXKRNL_INFO("SwitchToFiber: {:#010x} is the running fiber; returning (reported once)",
