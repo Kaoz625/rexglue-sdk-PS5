@@ -14,7 +14,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -37,6 +39,9 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_UINT32(gpu_log_resolve_summary, 0, "GPU",
+                      "Diagnostic: every this many resolves, log each distinct resolve "
+                      "(EDRAM source, size, destination) with its count, rarest first; 0 = off");
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -1143,6 +1148,46 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
+  }
+
+  // Diagnostic (gpu_log_resolve_summary = N): count each distinct resolve
+  // (EDRAM source, size, destination, clears) and every N resolves log them,
+  // rarest first, so a copy that happens only during a glitch stands out.
+  if (uint32_t summary_every = REXCVAR_GET(gpu_log_resolve_summary)) {
+    static std::map<std::string, uint32_t> resolve_kinds;
+    static uint32_t resolves_seen = 0;
+    const draw_util::ResolveEdramInfo& edram = resolve_info.IsCopyingDepth()
+                                                   ? resolve_info.depth_edram_info
+                                                   : resolve_info.color_edram_info;
+    const auto& coord = resolve_info.coordinate_info;
+    const auto& dest = resolve_info.copy_dest_coordinate_info;
+    std::string kind = fmt::format(
+        "{} edram base={} pitch={} fmt={}{} src_off=({},{}) size={}x{} -> dest 0x{:08X} "
+        "pitch={} off=({},{}) dest_fmt={} copy={} clear_c={} clear_d={}",
+        resolve_info.IsCopyingDepth() ? "depth" : "color", uint32_t(edram.base_tiles),
+        uint32_t(edram.pitch_tiles), uint32_t(edram.format), edram.format_is_64bpp ? "/64" : "",
+        uint32_t(coord.edram_offset_x_div_8) * 8, uint32_t(coord.edram_offset_y_div_8) * 8,
+        uint32_t(coord.width_div_8) * 8, resolve_info.height_div_8 * 8,
+        resolve_info.copy_dest_base, uint32_t(dest.pitch_aligned_div_32) * 32,
+        uint32_t(dest.offset_x_div_8) * 8, uint32_t(dest.offset_y_div_8) * 8,
+        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        uint32_t(resolve_info.rb_copy_control.copy_command),
+        uint32_t(resolve_info.rb_copy_control.color_clear_enable),
+        uint32_t(resolve_info.rb_copy_control.depth_clear_enable));
+    ++resolve_kinds[kind];
+    if (++resolves_seen >= summary_every) {
+      std::vector<std::pair<uint32_t, const std::string*>> sorted;
+      for (const auto& entry : resolve_kinds) sorted.emplace_back(entry.second, &entry.first);
+      std::sort(sorted.begin(), sorted.end(),
+                [](const auto& x, const auto& y) { return x.first < y.first; });
+      REXGPU_INFO("Resolve summary: {} resolves, {} kinds (rarest first)", resolves_seen,
+                  sorted.size());
+      for (const auto& entry : sorted) {
+        REXGPU_INFO("  {:6} x {}", entry.first, *entry.second);
+      }
+      resolve_kinds.clear();
+      resolves_seen = 0;
+    }
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
