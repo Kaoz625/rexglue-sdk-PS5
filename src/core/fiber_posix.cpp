@@ -158,6 +158,9 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
 
 void Fiber::SwitchTo(Fiber* target) {
   Fiber* from = tls_current_;
+  // A switch to the running fiber would load its previous, stale stack
+  // pointer (target->sp_ is read before from->sp_ is saved): stay put.
+  if (target == from) return;
   from->CheckStack();
   tls_current_ = target;
   rex_ps5_fiber_switch(&from->sp_, target->sp_);

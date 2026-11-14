@@ -12,6 +12,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 
@@ -307,8 +308,23 @@ void SwitchToFiber_entry(mapped_void lpFiber) {
     return;
   }
 
-  // Save outgoing fiber's non-volatile registers and SP
+  // Switching to the fiber that is already running returns at once, as it
+  // does on the console and on Windows. Going through the host switch would
+  // resume this fiber at its previous suspension point, on stack it has since
+  // reused: a crash at a stale return address (Infinite Undiscovery's job
+  // fibers do this at the opening credits).
   uint32_t current_addr = static_cast<uint32_t>(kthread->fiber_ptr);
+  if (current_addr == target_addr ||
+      target_info->host_fiber == rex::thread::Fiber::Current()) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
+      REXKRNL_INFO("SwitchToFiber: {:#010x} is the running fiber; returning (reported once)",
+                   target_addr);
+    }
+    return;
+  }
+
+  // Save outgoing fiber's non-volatile registers and SP
   if (current_addr) {
     auto* current_fiber = mem->TranslateVirtual<X_FIBER_CONTEXT*>(current_addr);
     ctx->SaveNonVolatiles(current_fiber->register_save_area);
