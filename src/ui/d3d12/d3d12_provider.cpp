@@ -29,6 +29,9 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
                     "Break on Direct3D 12 validation warnings");
 
+REXCVAR_DEFINE_BOOL(d3d12_unaligned_block_textures, true, "UI/D3D12",
+                    "Use the driver's unaligned block-compressed texture support when it reports it; false = "
+                    "decompress such textures as on GPUs without it (x360-native: Xbox One S colour test)");
 REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
                      "Index of the DXGI adapter to use (-1 for any physical, -2 for WARP)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -433,7 +436,8 @@ bool D3D12Provider::Initialize() {
   D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8;
   if (SUCCEEDED(
           device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8)))) {
-    unaligned_block_textures_supported_ = bool(options8.UnalignedBlockTexturesSupported);
+    unaligned_block_textures_supported_ =
+        bool(options8.UnalignedBlockTexturesSupported) && REXCVAR_GET(d3d12_unaligned_block_textures);
   }
   virtual_address_bits_per_resource_ = 0;
   D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT virtual_address_support;
