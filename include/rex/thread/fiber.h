@@ -14,7 +14,7 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_PS5
+#if REX_FIBER_OWN_SWITCH
 #include <cstdint>
 #include <vector>
 #elif REX_PLATFORM_POSIX
@@ -59,7 +59,7 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
-#elif REX_PLATFORM_PS5
+#elif REX_FIBER_OWN_SWITCH
   // The console's getcontext() writes a larger context than the SDK's
   // ucontext_t declares, so fibers switch with a small routine of their own
   // (fiber_posix.cpp) and keep only the suspended stack pointer.

@@ -55,7 +55,9 @@
 #include <linux/ashmem.h>
 
 // TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#if REX_PLATFORM_ANDROID
+#include <rex/main_android.h>
+#endif
 #endif
 
 namespace rex {

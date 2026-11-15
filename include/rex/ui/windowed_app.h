@@ -24,7 +24,7 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID && 0  // ours: SDL's activity calls SDL_main, one app (REX_DEFINE_APP)
 // Multiple apps in a single library instead of separate executables.
 #define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
 #endif

@@ -69,6 +69,9 @@
 
 // SDL makes the Vulkan surface (PS5: VK_KHR_display plane; Android: the ANativeWindow, VK_KHR_android_surface).
 #define REX_SDL_VULKAN_SURFACE (REX_PLATFORM_PS5 || REX_PLATFORM_ANDROID)
+// Fibers switch with their own small routine (fiber_posix.cpp): PS5 (its getcontext overruns ucontext_t) and
+// Android (bionic has no getcontext/makecontext/swapcontext).
+#define REX_FIBER_OWN_SWITCH (REX_PLATFORM_PS5 || REX_PLATFORM_ANDROID)
 
 // The POSIX sources (*_posix.cpp) serve Linux, macOS and the PS5.
 #define REX_PLATFORM_POSIX (REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5)
@@ -76,7 +79,7 @@
 // libc++ without floating-point std::from_chars or std::chrono::clock_cast, and
 // with std::jthread behind -fexperimental-library: Apple's, and the PS5 payload
 // SDK's (LLVM 18).
-#define REX_LIBCXX_LIMITED (REX_PLATFORM_MAC || REX_PLATFORM_PS5)
+#define REX_LIBCXX_LIMITED (REX_PLATFORM_MAC || REX_PLATFORM_PS5 || REX_PLATFORM_ANDROID)
 
 #if defined(__clang__)
 #define REX_COMPILER_CLANG 1

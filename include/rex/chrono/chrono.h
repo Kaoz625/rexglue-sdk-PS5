@@ -116,7 +116,7 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
 
 namespace std::chrono {
 
-#if defined(__APPLE__) || defined(__PROSPERO__)
+#if defined(__APPLE__) || defined(__PROSPERO__) || defined(__ANDROID__)
 // Apple libc++ and the PS5 SDK's libc++ 18 do not expose clock_time_conversion
 // or clock_cast.
 template <class, class>

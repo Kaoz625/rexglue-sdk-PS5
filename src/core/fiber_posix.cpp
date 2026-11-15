@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if REX_PLATFORM_PS5
+#if REX_FIBER_OWN_SWITCH
 #include <atomic>
 #include <rex/logging.h>
 #endif
@@ -34,6 +34,7 @@ namespace rex::thread {
 
 thread_local Fiber* Fiber::tls_current_ = nullptr;
 
+#if REX_FIBER_OWN_SWITCH
 #if REX_PLATFORM_PS5
 // PS5: getcontext()/swapcontext() from the console's libkernel write a
 // context larger than the SDK's ucontext_t, which overran the heap block
@@ -78,6 +79,60 @@ rex_ps5_fiber_switch:
     ret
     .size rex_ps5_fiber_switch, .-rex_ps5_fiber_switch
 )");
+#define REX_FIBER_SWITCH rex_ps5_fiber_switch
+#elif REX_PLATFORM_ANDROID && defined(__aarch64__)
+// Android arm64: bionic has no ucontext functions. Same idea as the PS5 routine: fibers switch only at SwitchTo
+// calls, so the AAPCS64 callee-saved state is the whole context - x19-x28, fp (x29), lr (x30), d8-d15 and FPCR -
+// saved on the fiber's own stack in a 176-byte frame (16-byte aligned), lr last restored so `ret` lands in the
+// switched-to fiber.
+//
+//   void rex_a64_fiber_switch(void** save_sp, void* load_sp)
+//
+// Frame from sp up: x19..x28 (0-79), x29 x30 (80-95), d8..d15 (96-159), FPCR (160), spare (168).
+extern "C" void rex_a64_fiber_switch(void** save_sp, void* load_sp);
+asm(R"(
+    .text
+    .p2align 4
+    .globl rex_a64_fiber_switch
+    .hidden rex_a64_fiber_switch
+    .type rex_a64_fiber_switch, %function
+rex_a64_fiber_switch:
+    sub sp, sp, #176
+    stp x19, x20, [sp, #0]
+    stp x21, x22, [sp, #16]
+    stp x23, x24, [sp, #32]
+    stp x25, x26, [sp, #48]
+    stp x27, x28, [sp, #64]
+    stp x29, x30, [sp, #80]
+    stp d8, d9, [sp, #96]
+    stp d10, d11, [sp, #112]
+    stp d12, d13, [sp, #128]
+    stp d14, d15, [sp, #144]
+    mrs x9, fpcr
+    str x9, [sp, #160]
+    mov x9, sp
+    str x9, [x0]
+    mov sp, x1
+    ldr x9, [sp, #160]
+    msr fpcr, x9
+    ldp x19, x20, [sp, #0]
+    ldp x21, x22, [sp, #16]
+    ldp x23, x24, [sp, #32]
+    ldp x25, x26, [sp, #48]
+    ldp x27, x28, [sp, #64]
+    ldp x29, x30, [sp, #80]
+    ldp d8, d9, [sp, #96]
+    ldp d10, d11, [sp, #112]
+    ldp d12, d13, [sp, #128]
+    ldp d14, d15, [sp, #144]
+    add sp, sp, #176
+    ret
+    .size rex_a64_fiber_switch, .-rex_a64_fiber_switch
+)");
+#define REX_FIBER_SWITCH rex_a64_fiber_switch
+#else
+#error "REX_FIBER_OWN_SWITCH: no fiber switch routine for this platform"
+#endif
 
 Fiber* Fiber::ConvertCurrentThread() {
   // The thread's context is saved by the first SwitchTo away from it.
@@ -127,6 +182,7 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
   f->stack_.resize(stack_size);
   std::memset(f->stack_.data(), kStackFill, kStackGuardBytes);
 
+#if REX_PLATFORM_PS5
   // A first frame for rex_ps5_fiber_switch to "return" through into
   // Trampoline. Trampoline then starts with rsp = 8 (mod 16), as after a
   // call, and a zero return address above it ends any backtrace there.
@@ -144,6 +200,16 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
   *slot = 0;
   std::memcpy(slot, &mxcsr, 4);
   std::memcpy(reinterpret_cast<uint8_t*>(slot) + 4, &fpucw, 2);
+#else  // Android arm64: a first frame for rex_a64_fiber_switch, its lr = Trampoline, fp = 0 (ends backtraces).
+  uintptr_t top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size());
+  top &= ~uintptr_t(15);
+  auto* slot = reinterpret_cast<uint64_t*>(top) - 22;  // 176 bytes
+  std::memset(slot, 0, 176);
+  slot[11] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);  // x30 (offset 88)
+  uint64_t fpcr;
+  asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+  slot[20] = fpcr;  // offset 160
+#endif
   f->sp_ = slot;
   return f;
 }
@@ -163,10 +229,10 @@ void Fiber::SwitchTo(Fiber* target) {
   if (target == from) return;
   from->CheckStack();
   tls_current_ = target;
-  rex_ps5_fiber_switch(&from->sp_, target->sp_);
+  REX_FIBER_SWITCH(&from->sp_, target->sp_);
 }
 
-#else  // !REX_PLATFORM_PS5
+#else  // !REX_FIBER_OWN_SWITCH
 
 Fiber* Fiber::ConvertCurrentThread() {
   auto* f = new Fiber();
@@ -209,7 +275,7 @@ void Fiber::SwitchTo(Fiber* target) {
   swapcontext(&from->context_, &target->context_);
 }
 
-#endif  // REX_PLATFORM_PS5
+#endif  // REX_FIBER_OWN_SWITCH
 
 void Fiber::Destroy() {
   // Thread fibers are destroyed from the owning thread itself.
