@@ -17,6 +17,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -363,7 +364,11 @@ class KernelState {
   std::vector<object_ref<XNotifyListener>> notify_listeners_;
   bool has_notified_startup_ = false;
 
-  // Protected by global_critical_region_.
+  // Protected by fiber_map_mutex_ (its own lock, not the global critical
+  // region: SwitchToFiber looks a fiber up on every switch, thousands of times
+  // a second in fiber-heavy games, and contending the global region there
+  // cost Infinite Undiscovery's main thread a lot of time on the PS5).
+  std::shared_mutex fiber_map_mutex_;
   std::unordered_map<uint32_t, FiberInfo> fiber_map_;
 
   // Fiber name pool for profiling.

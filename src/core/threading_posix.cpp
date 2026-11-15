@@ -460,8 +460,13 @@ class PosixCondition<Event> : public PosixConditionBase {
   virtual ~PosixCondition() = default;
 
   bool Signal() override {
-    auto lock = std::unique_lock<std::mutex>(mutex_);
-    signal_ = true;
+    {
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      signal_ = true;
+    }
+    // Notified after unlocking, so a woken waiter doesn't block straight away
+    // on the mutex this thread still holds (an extra kernel round trip per
+    // wake on the PS5, where games set events thousands of times a second).
     cond_.notify_all();
     return true;
   }
@@ -491,14 +496,17 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   bool Signal() override { return Release(1, nullptr); }
 
   bool Release(uint32_t release_count, int* out_previous_count) {
-    auto lock = std::unique_lock<std::mutex>(mutex_);
-    if (release_count > maximum_count_ - count_) {
-      return false;
+    {
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      if (release_count > maximum_count_ - count_) {
+        return false;
+      }
+      if (out_previous_count) {
+        *out_previous_count = count_;
+      }
+      count_ += release_count;
     }
-    if (out_previous_count) {
-      *out_previous_count = count_;
-    }
-    count_ += release_count;
+    // After unlocking, as in PosixCondition<Event>::Signal.
     cond_.notify_all();
     return true;
   }

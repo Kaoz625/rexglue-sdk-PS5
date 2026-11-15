@@ -1370,18 +1370,18 @@ bool KernelState::Restore(stream::ByteStream* stream) {
 }
 
 FiberInfo* KernelState::LookupFiber(uint32_t guest_addr) {
-  auto lock = global_critical_region_.Acquire();
+  std::shared_lock lock(fiber_map_mutex_);
   auto it = fiber_map_.find(guest_addr);
   return it != fiber_map_.end() ? &it->second : nullptr;
 }
 
 void KernelState::RegisterFiber(uint32_t guest_addr, const FiberInfo& info) {
-  auto lock = global_critical_region_.Acquire();
+  std::unique_lock lock(fiber_map_mutex_);
   fiber_map_[guest_addr] = info;
 }
 
 void KernelState::UnregisterFiber(uint32_t guest_addr) {
-  auto lock = global_critical_region_.Acquire();
+  std::unique_lock lock(fiber_map_mutex_);
   fiber_map_.erase(guest_addr);
 }
 
