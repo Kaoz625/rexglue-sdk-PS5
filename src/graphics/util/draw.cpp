@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 
@@ -997,8 +998,13 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                                                      rb_copy_dest_pitch.copy_dest_pitch, bpp_log2);
     }
   } else {
-    REXGPU_ERROR("Tried to resolve to format {}, which is not a ColorFormat",
-                 dest_format_info.name);
+    // Logged a few times, then every 10000th: MK vs DC resolves to format 0 (k_1_REVERSE) every frame, 38,479
+    // lines filled its 5 MB log in minutes (no frame stats left) and cost time on the One S (5 Nov).
+    static std::atomic<uint64_t> not_color_resolves{0};
+    if (uint64_t n = ++not_color_resolves; n <= 4 || n % 10000 == 0) {
+      REXGPU_ERROR("Tried to resolve to format {}, which is not a ColorFormat ({} times so far)",
+                   dest_format_info.name, n);
+    }
     copy_dest_extent_start = copy_dest_base_adjusted;
     copy_dest_extent_end = copy_dest_base_adjusted;
   }
