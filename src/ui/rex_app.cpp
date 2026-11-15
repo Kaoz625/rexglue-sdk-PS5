@@ -322,10 +322,6 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   return true;
 }
 
-std::unique_ptr<rex::ui::Window> ReXApp::CreateMainWindow() {
-  return rex::ui::Window::Create(app_context(), GetName());
-}
-
 bool ReXApp::SetupPresentation() {
   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
