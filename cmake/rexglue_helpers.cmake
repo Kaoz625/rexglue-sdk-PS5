@@ -157,8 +157,8 @@ function(rexglue_configure_target target_name)
                 "rexglue_configure_target: unknown GPU plugin '${_plugin}' "
                 "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
         endif()
-        if(PS5)
-            # Static on the console: link it in (LoadGpuPlugin calls it), and
+        if(PS5 OR ANDROID)
+            # Static on the console (and in Android's libmain.so): link it in (LoadGpuPlugin calls it), and
             # refer to its factory strongly so the linker takes it out of the
             # archive (the loader's own reference is weak).
             target_link_libraries(${target_name} PRIVATE ${_plugin_target})

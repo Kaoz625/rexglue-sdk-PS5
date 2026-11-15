@@ -167,6 +167,10 @@ elseif(PS5)
     # FreeBSD, so this has to come before the generic UNIX branch.
     set(REX_PLATFORM "ps5-amd64")
     add_compile_definitions(REX_PLATFORM_PS5=1)
+elseif(ANDROID)
+    # Android NDK (arm64-v8a): one libmain.so, loaded by SDL's activity. platform.h sets REX_PLATFORM_ANDROID +
+    # REX_PLATFORM_LINUX from __ANDROID__. The recompiler runs on the build host (REXGLUE_HOST_TOOL), as for PS5.
+    set(REX_PLATFORM "android-arm64")
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
@@ -274,7 +278,7 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-if(PS5)
+if(PS5 OR ANDROID)
     # The recompiler runs on the build host, never on the console: a cross
     # build imports the host's rexglue (built from this same tree) instead.
     set(REXGLUE_HOST_TOOL "" CACHE FILEPATH "Host-built rexglue for a PS5 cross build")

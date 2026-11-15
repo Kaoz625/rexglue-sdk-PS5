@@ -114,6 +114,10 @@ if(PS5)
                 -DALSO=$<TARGET_FILE:rexgpu-xenos>
                 -P ${REXGLUE_ROOT}/cmake/rex_ps5_isolate_vma.cmake
         VERBATIM)
+elseif(ANDROID)
+    # Android: static in libmain.so, linked by rexglue_setup_target(GPU_PLUGINS xenos) as on PS5.
+    add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
+    set_target_properties(rexgpu-xenos PROPERTIES EXCLUDE_FROM_ALL ON)
 else()
     add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 endif()

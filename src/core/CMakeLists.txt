@@ -24,7 +24,7 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
-if(APPLE OR PS5)
+if(APPLE OR PS5 OR ANDROID)
     # Apple's libc++ (and the PS5 SDK's libc++ 18) still gates std::jthread/std::stop_token behind the
     # experimental-library feature flag. Only timer_queue.cpp uses them, and
     # neither type crosses a header boundary.
@@ -108,6 +108,9 @@ if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
 elseif(PS5)
     # libc, libkernel and pthreads come with the title's link (ps5/link-title.sh).
+elseif(ANDROID)
+    # bionic has pthread and rt in libc.
+    target_link_libraries(rexcore PRIVATE dl log)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()

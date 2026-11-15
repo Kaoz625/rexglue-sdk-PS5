@@ -34,8 +34,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
-#elif REX_PLATFORM_PS5
-// No window system on the console: SDL makes the VK_KHR_display surface.
+#elif REX_SDL_VULKAN_SURFACE
+// No window system on the console (PS5) / SDL owns the ANativeWindow (Android): SDL makes the VK_KHR_display surface.
 #include <rex/ui/surface_ps5.h>
 #else
 #include <X11/Xlib-xcb.h>
@@ -459,7 +459,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       SDL_Metal_DestroyView(metal_view);
     }
   }
-#elif REX_PLATFORM_PS5
+#elif REX_SDL_VULKAN_SURFACE
   if (allowed_types & Surface::kTypeFlag_SDLVulkan) {
     return std::make_unique<SDLVulkanSurface>(sdl_window_);
   }

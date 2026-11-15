@@ -67,6 +67,9 @@
 #define REX_PLATFORM_PS5 0
 #endif
 
+// SDL makes the Vulkan surface (PS5: VK_KHR_display plane; Android: the ANativeWindow, VK_KHR_android_surface).
+#define REX_SDL_VULKAN_SURFACE (REX_PLATFORM_PS5 || REX_PLATFORM_ANDROID)
+
 // The POSIX sources (*_posix.cpp) serve Linux, macOS and the PS5.
 #define REX_PLATFORM_POSIX (REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5)
 

@@ -33,7 +33,7 @@
 #include <ffx_api/vk/ffx_api_vk.h>
 #endif
 
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID && 0  // xenia's ANativeWindow path (no surface_android.h): Android uses the SDL surface
 #include <rex/ui/surface_android.h>
 #endif
 #if REX_PLATFORM_GNU_LINUX
@@ -44,7 +44,7 @@
 #endif
 #if REX_PLATFORM_MAC
 #include <rex/ui/surface_mac.h>
-#elif REX_PLATFORM_PS5
+#elif REX_SDL_VULKAN_SURFACE
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -428,7 +428,7 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     return 0;
   }
   Surface::TypeFlags type_flags = 0;
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID && 0
   if (instance_extensions.ext_KHR_android_surface) {
     type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
   }
@@ -453,6 +453,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #endif
 #if REX_PLATFORM_PS5
   if (instance_extensions.ext_KHR_surface && instance_extensions.ext_KHR_display) {
+    type_flags |= Surface::kTypeFlag_SDLVulkan;
+  }
+#endif
+#if REX_PLATFORM_ANDROID
+  if (instance_extensions.ext_KHR_surface && instance_extensions.ext_KHR_android_surface) {
     type_flags |= Surface::kTypeFlag_SDLVulkan;
   }
 #endif
@@ -806,7 +811,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
     switch (surface_type) {
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID && 0
       case Surface::kTypeIndex_AndroidNativeWindow: {
         auto& android_native_window_surface =
             static_cast<const AndroidNativeWindowSurface&>(new_surface);
@@ -868,7 +873,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
       } break;
 #endif
-#if REX_PLATFORM_PS5
+#if REX_SDL_VULKAN_SURFACE
       case Surface::kTypeIndex_SDLVulkan: {
         // SDL's PS5 driver makes the display-plane surface (VK_KHR_display)
         // through the same RADV this instance comes from.

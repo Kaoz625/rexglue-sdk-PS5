@@ -72,7 +72,8 @@ elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_mac.cpp
     )
-elseif(PS5)
+elseif(PS5 OR ANDROID)
+    # Android: SDL owns the ANativeWindow and makes the Vulkan surface, the same SDLVulkanSurface as PS5.
     # No window system: the title presents through VK_KHR_display (SDL's PS5
     # video driver). A title on the SDK's Xenos GPU presents through an
     # SDL-made surface (surface_ps5.cpp); others render and present themselves.
@@ -153,7 +154,7 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 # Platform-specific dependencies
-if(UNIX AND NOT APPLE AND NOT PS5)
+if(UNIX AND NOT APPLE AND NOT PS5 AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every

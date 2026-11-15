@@ -58,6 +58,9 @@ if(PS5)
                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/isolate-vma
                 -P ${REXGLUE_ROOT}/cmake/rex_ps5_isolate_vma.cmake
         VERBATIM)
+elseif(ANDROID)
+    # Android: everything in the app's one libmain.so (no VMA isolation needed: the game has no VMA of its own).
+    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
 else()
     add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
 endif()

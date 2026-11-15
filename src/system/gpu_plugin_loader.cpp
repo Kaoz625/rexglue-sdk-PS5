@@ -54,7 +54,7 @@ namespace {
 
 }  // namespace
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_ANDROID
 }  // namespace rex::system
 
 // The console has no dynamic loading: a title that asks for the Xenos GPU
@@ -134,6 +134,6 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
   REXSYS_DEBUG("GPU plugin '{}' loaded ({})", name, path.filename().string());
   return std::unique_ptr<IGraphicsSystem>(graphics_system);
 }
-#endif  // REX_PLATFORM_PS5
+#endif  // REX_PLATFORM_PS5 || REX_PLATFORM_ANDROID
 
 }  // namespace rex::system
