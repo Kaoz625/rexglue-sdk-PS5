@@ -131,3 +131,11 @@ int main(int argc, char* argv[]) {
 }
 
 #endif
+
+#if REX_PLATFORM_ANDROID
+// Android: SDL's activity loads libmain.so and calls SDL_main by name (dlsym), so it must be exported; the app's
+// libraries are built with hidden visibility.
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
+  return main(argc, argv);
+}
+#endif
