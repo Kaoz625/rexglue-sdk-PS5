@@ -112,6 +112,14 @@ bool ReXApp::OnInitialize() {
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
+  // The config next to the exe is loaded again below (after OnConfigurePaths may move it), but the
+  // path cvars are read right here, so load it first too: otherwise game_data_root and the other
+  // *_root settings in <name>.toml are never used.
+  if (auto early_config = exe_dir / (std::string(GetName()) + ".toml");
+      std::filesystem::exists(early_config)) {
+    rex::cvar::LoadConfig(early_config);
+  }
+
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
@@ -210,7 +218,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!std::filesystem::is_directory(paths.game_data_root)) {
+  // A folder of game files, a disc image (.iso), or an http:// URL of one; Runtime::SetupVfs
+  // mounts each.
+  bool game_root_is_url = paths.game_data_root.string().starts_with("http://");
+  if (!game_root_is_url && !std::filesystem::exists(paths.game_data_root)) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -278,7 +289,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::string host_tail{tail};
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
+    // A disc image holds the XEX itself; the VFS reports a missing one when it loads.
+    if (!game_root_is_url && !std::filesystem::is_regular_file(paths.game_data_root) &&
+        !std::filesystem::is_regular_file(xex_host)) {
       auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -306,6 +319,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   OnPostSetup();
 
   return true;
+}
+
+std::unique_ptr<rex::ui::Window> ReXApp::CreateMainWindow() {
+  return rex::ui::Window::Create(app_context(), GetName());
 }
 
 bool ReXApp::SetupPresentation() {
