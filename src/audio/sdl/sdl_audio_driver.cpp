@@ -24,6 +24,53 @@
 #include <rex/perf/counter.h>
 #include <SDL3/SDL.h>
 
+#if REX_PLATFORM_PS5
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <thread>
+extern "C" int sceAudioOutInit(void);
+extern "C" int sceAudioOutOpen(int32_t user, int32_t type, int32_t index, uint32_t len, uint32_t freq,
+                               uint32_t param);
+extern "C" int sceAudioOutClose(int32_t port);
+
+namespace {
+// 15 Nov 2026: MK vs DC on PHAT5 (FW 10.20, HDMI just switched to 1080p 119.88 Hz) never came back from opening the
+// audio port, so the guest thread that registers its audio client hung with it and the console wedged when the title
+// was killed. Probe the same open SDL's PS5 driver does on a helper thread first: if it does not return within
+// audio_open_timeout_ms, the driver fails (the game runs silent, AudioSystem drops frames) instead of hanging. A
+// probe that never returns stays parked on its own thread; no SDL lock is held by it.
+REXCVAR_DEFINE_INT32(audio_open_timeout_ms, 5000, "Audio",
+                     "PS5: give up on the audio port after this many ms and run silent (0 = wait forever)");
+
+bool Ps5AudioPortAnswers() {
+  const int timeout_ms = REXCVAR_GET(audio_open_timeout_ms);
+  if (timeout_ms <= 0) return true;
+  auto state = std::make_shared<std::atomic<int>>(0);  // 0 waiting, 1 opened, 2 failed
+  std::thread([state] {
+    const int init = sceAudioOutInit();
+    if (init < 0 && init != int(0x8026000e)) {
+      state->store(2);
+      return;
+    }
+    const int port = sceAudioOutOpen(0xff, 0, 0, 256, 48000, 1);
+    if (port >= 0) sceAudioOutClose(port);
+    state->store(port >= 0 ? 1 : 2);
+  }).detach();
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (state->load() == 0 && std::chrono::steady_clock::now() < end)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const int result = state->load();
+  if (result == 0) {
+    REXAPU_ERROR("PS5 audio: sceAudioOutOpen did not return within {} ms - running without sound", timeout_ms);
+    return false;
+  }
+  if (result == 2) REXAPU_WARN("PS5 audio: the probe open failed; SDL will try anyway");
+  return true;
+}
+}  // namespace
+#endif
+
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 
 namespace rex::audio::sdl {
@@ -56,6 +103,9 @@ bool SDLAudioDriver::Initialize() {
 }
 
 bool SDLAudioDriver::InitializeDevice() {
+#if REX_PLATFORM_PS5
+  if (!Ps5AudioPortAnswers()) return false;
+#endif
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
