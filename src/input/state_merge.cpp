@@ -38,9 +38,10 @@ void MergeInto(X_INPUT_STATE& dst, const X_INPUT_STATE& src) {
   dst.gamepad.thumb_rx = LargerMagnitude(dst.gamepad.thumb_rx, src.gamepad.thumb_rx);
   dst.gamepad.thumb_ry = LargerMagnitude(dst.gamepad.thumb_ry, src.gamepad.thumb_ry);
 
-  if (static_cast<uint32_t>(src.packet_number) > static_cast<uint32_t>(dst.packet_number)) {
-    dst.packet_number = src.packet_number;
-  }
+  // The sum, not the larger: games skip a state whose packet number did not change, and with the larger one a
+  // device with a smaller count (Army of Two's script pad next to a real pad, 4 Nov 2026) changed the buttons
+  // without changing the number - its presses were dropped at random. The sum changes when any device's does.
+  dst.packet_number = static_cast<uint32_t>(dst.packet_number) + static_cast<uint32_t>(src.packet_number);
 }
 
 bool IsNeutral(const X_INPUT_GAMEPAD& gamepad) {
