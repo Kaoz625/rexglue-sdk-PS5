@@ -18,6 +18,7 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
@@ -31,6 +32,9 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(texture_force_base_mip, false, "GPU/D3D12",
+                    "Diagnosis: sample every texture at its base mip level (x360-native)");
 
 namespace rex::graphics::d3d12 {
 
@@ -960,6 +964,10 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   xenos::TextureFilter mip_filter = binding.mip_filter == xenos::TextureFilter::kUseFetchConst
                                         ? fetch.mip_filter
                                         : binding.mip_filter;
+  // x360-native diagnosis: sample every texture at its base mip (rules level-of-detail selection in or out).
+  if (REXCVAR_GET(texture_force_base_mip)) {
+    mip_filter = xenos::TextureFilter::kBaseMap;
+  }
   bool min_mag_linear = (mag_filter == xenos::TextureFilter::kLinear) &&
                         (min_filter == xenos::TextureFilter::kLinear);
   bool mip_filter_bilinear_or_trilinear =
