@@ -30,6 +30,8 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <cerrno>
 #endif
 
 #include <rex/cvar.h>
@@ -137,7 +139,43 @@ class HttpSource : public DiscSource {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* addrs = nullptr;
-    if (getaddrinfo(host_.c_str(), port_.c_str(), &hints, &addrs) != 0) {
+#if !REX_PLATFORM_WIN32
+    // A numeric IPv4 host connects without the resolver: a PS5 homebrew title's getaddrinfo is not usable
+    // (15 Nov 2026, MK vs DC on DIGI5: the HEAD failed in 20 ms and never reached mac1).
+    static addrinfo numeric{};
+    static sockaddr_in numeric_addr{};
+    if (inet_pton(AF_INET, host_.c_str(), &numeric_addr.sin_addr) == 1) {
+      numeric_addr.sin_family = AF_INET;
+      numeric_addr.sin_port = htons(static_cast<uint16_t>(std::atoi(port_.c_str())));
+      numeric = addrinfo{};
+      numeric.ai_family = AF_INET;
+      numeric.ai_socktype = SOCK_STREAM;
+      numeric.ai_addr = reinterpret_cast<sockaddr*>(&numeric_addr);
+      numeric.ai_addrlen = sizeof(numeric_addr);
+      Socket s = socket(AF_INET, SOCK_STREAM, 0);
+      if (s == kNoSocket) {
+        REXFS_ERROR("Disc image: socket() failed, errno {}", errno);
+        return false;
+      }
+      int one = 1;
+      setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      if (int kb = REXCVAR_GET(disc_http_rcvbuf_kb); kb > 0) {
+        int bytes = kb * 1024;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+      }
+      timeval timeout{30, 0};
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+      if (connect(s, numeric.ai_addr, numeric.ai_addrlen) != 0) {
+        REXFS_ERROR("Disc image: connect {}:{} failed, errno {}", host_, port_, errno);
+        CloseSocket(s);
+        return false;
+      }
+      sock_ = s;
+      return true;
+    }
+#endif
+    if (int rc = getaddrinfo(host_.c_str(), port_.c_str(), &hints, &addrs); rc != 0) {
+      REXFS_ERROR("Disc image: getaddrinfo({}) failed ({})", host_, rc);
       return false;
     }
     for (auto* a = addrs; a && sock_ == kNoSocket; a = a->ai_next) {
