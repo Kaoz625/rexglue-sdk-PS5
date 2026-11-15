@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -30,6 +31,24 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define REX_CS_SPIN_PAUSE() _mm_pause()
+#elif defined(_M_ARM64) || defined(_M_ARM)
+#include <intrin.h>
+#define REX_CS_SPIN_PAUSE() __yield()
+#elif defined(__aarch64__) || defined(__arm__)
+#define REX_CS_SPIN_PAUSE() __asm__ __volatile__("yield")
+#else
+#define REX_CS_SPIN_PAUSE() ((void)0)
+#endif
+
+REXCVAR_DEFINE_UINT32(cs_min_spin_count, 4000, "Kernel",
+                      "Minimum spin iterations in RtlEnterCriticalSection before the kernel wait "
+                      "(the guest's own spin count, absolute*256, wins when larger). Guest critical "
+                      "sections usually have spin count 0, so a contended lock otherwise goes "
+                      "straight to a full event wait. 0 = guest spin count only (old behaviour)");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -387,14 +406,24 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
     return;
   }
 
-  // Spin loop
+  // Spin before the kernel wait: at least cs_min_spin_count iterations, or the
+  // guest's own spin count when that is larger.
+  const uint32_t min_spin = REXCVAR_GET(cs_min_spin_count);
+  if (spin_count < min_spin) {
+    spin_count = min_spin;
+  }
+
+  // Spin loop. Only try the CAS when the lock reads free, so spinners do not
+  // keep stealing the cache line from the owner; pause between reads.
   while (spin_count--) {
-    if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+    if (*reinterpret_cast<volatile int32_t*>(&cs->lock_count) == -1 &&
+        rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
       // Acquired.
       cs->owning_thread = cur_thread;
       cs->recursion_count = 1;
       return;
     }
+    REX_CS_SPIN_PAUSE();
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
