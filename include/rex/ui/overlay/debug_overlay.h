@@ -39,6 +39,7 @@ class DebugOverlayDialog : public ImGuiDialog {
   FrameStatsProvider stats_provider_;
   // PS5: memory, thread load and GPU-memory traffic, refreshed twice a second.
   void DrawPs5Stats();
+  void DrawCompact(ImGuiIO& io);
   struct Ps5Stats {
     uint64_t sample_time_ns = 0;
     uint64_t gpu_thread_cpu_ns = 0;
@@ -58,6 +59,9 @@ class DebugOverlayDialog : public ImGuiDialog {
     double flexible_total_mb = 0;
     double flexible_free_mb = 0;
   } ps5_{};
+  // Refreshes ps5_ at most twice a second (no-op elsewhere).
+  void SamplePs5Stats();
+  void DrawPs5StatsText(Ps5Stats& p);
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};

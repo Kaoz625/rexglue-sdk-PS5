@@ -10,6 +10,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/cvar.h>
 #include <rex/platform.h>
 #include <rex/version.h>
 #include <imgui.h>
@@ -26,6 +27,11 @@
 #include <cinttypes>
 #endif
 
+REXCVAR_DEFINE_BOOL(debug_overlay_compact, false, "UI",
+                    "Debug overlay (F3, or L3 + R3): show only a small frame-rate readout "
+                    "in the top-left corner instead of the full panel.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::ui {
 
 DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProvider stats_provider)
@@ -34,6 +40,10 @@ DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProv
 DebugOverlayDialog::~DebugOverlayDialog() {}
 
 void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
+  if (REXCVAR_GET(debug_overlay_compact)) {
+    DrawCompact(io);
+    return;
+  }
   ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
@@ -124,8 +134,43 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::PopStyleColor();
 }
 
+void DebugOverlayDialog::DrawCompact(ImGuiIO& io) {
+  const float tv_scale = std::max(1.0f, io.DisplaySize.y / 720.0f);
+  ImGui::SetNextWindowPos(ImVec2(8 * tv_scale, 8 * tv_scale), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.45f);
+  if (ImGui::Begin("##fps_compact", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing)) {
+    ImGui::SetWindowFontScale(tv_scale);
+    FrameStats stats;
+    if (stats_provider_) {
+      stats = stats_provider_();
+    }
+    if (stats.frame_count > 0) {
+      ImGui::Text("%.1f FPS  %.1f ms", stats.fps, stats.frame_time_ms);
+    } else {
+      ImGui::TextUnformatted("-- FPS");
+    }
+#if REX_PLATFORM_PS5
+    SamplePs5Stats();
+    if (ps5_.gpu_thread_load >= 0) {
+      ImGui::Text("GPU emu %.0f%%", ps5_.gpu_thread_load);
+    }
+#endif
+  }
+  ImGui::End();
+}
+
 void DebugOverlayDialog::DrawPs5Stats() {
 #if REX_PLATFORM_PS5
+  SamplePs5Stats();
+  DrawPs5StatsText(ps5_);
+#endif
+}
+
+#if REX_PLATFORM_PS5
+void DebugOverlayDialog::SamplePs5Stats() {
   timespec now_ts;
   clock_gettime(CLOCK_MONOTONIC, &now_ts);
   const uint64_t now = uint64_t(now_ts.tv_sec) * 1000000000ull + uint64_t(now_ts.tv_nsec);
@@ -177,6 +222,9 @@ void DebugOverlayDialog::DrawPs5Stats() {
     }
     p.sample_time_ns = now;
   }
+}
+
+void DebugOverlayDialog::DrawPs5StatsText(Ps5Stats& p) {
   ImGui::Separator();
   auto load_text = [](const char* label, double value) {
     if (value < 0) {
@@ -199,7 +247,7 @@ void DebugOverlayDialog::DrawPs5Stats() {
     ImGui::Text("Flexible memory: %.0f / %.0f MB used", p.flexible_total_mb - p.flexible_free_mb,
                 p.flexible_total_mb);
   }
-#endif
 }
+#endif
 
 }  // namespace rex::ui
