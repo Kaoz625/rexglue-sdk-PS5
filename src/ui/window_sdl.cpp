@@ -653,4 +653,22 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
   }
 }
 
+// Fingers on a touch screen (phones): one TouchEvent per finger change, in physical pixels like mouse events.
+// The pointer id is SDL's finger id; SDL also synthesizes mouse events from the first finger by default.
+void WindowSDL::HandleTouchEvent(SDL_Event& event) {
+  int width = 0, height = 0;
+  SDL_GetWindowSizeInPixels(sdl_window_, &width, &height);
+  TouchEvent::Action action = TouchEvent::Action::kMove;
+  switch (event.type) {
+    case SDL_EVENT_FINGER_DOWN: action = TouchEvent::Action::kDown; break;
+    case SDL_EVENT_FINGER_UP: action = TouchEvent::Action::kUp; break;
+    case SDL_EVENT_FINGER_CANCELED: action = TouchEvent::Action::kCancel; break;
+    default: break;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  TouchEvent e(this, uint32_t(event.tfinger.fingerID), action, event.tfinger.x * float(width),
+               event.tfinger.y * float(height));
+  OnTouchEvent(e, destruction_receiver);
+}
+
 }  // namespace rex::ui
