@@ -233,9 +233,14 @@ configure_file(
 )
 
 # Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# x360-native: REX_OUTPUT_ROOT lets a second build of the same platform (the Xbox One build, static C runtime)
+# keep its libraries apart; sharing out/win-amd64 mixed /MT and /MD libraries into one link (29 Oct 2026).
+if(NOT REX_OUTPUT_ROOT)
+    set(REX_OUTPUT_ROOT "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REX_OUTPUT_ROOT}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REX_OUTPUT_ROOT}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REX_OUTPUT_ROOT}")
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)
