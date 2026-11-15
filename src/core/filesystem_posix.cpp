@@ -308,3 +308,16 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
 
 }  // namespace filesystem
 }  // namespace rex
+
+#if REX_PLATFORM_ANDROID
+namespace rex::filesystem {
+// xenia's Android content:// file opening went through its own Java side, which ReXGlue's Android build (SDL's
+// activity) does not have. Games here read plain paths or http:// disc images; a content:// URI fails cleanly.
+int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
+  (void)uri;
+  (void)mode;
+  errno = ENOTSUP;
+  return -1;
+}
+}  // namespace rex::filesystem
+#endif
