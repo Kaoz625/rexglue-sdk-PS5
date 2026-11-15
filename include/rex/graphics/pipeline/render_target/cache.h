@@ -171,6 +171,24 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // x360-native: the next Update takes over the depth render target's EDRAM range without copying the
+  // previous owner's contents, for a draw that overwrites all of it (the 360's fast-clear quads).
+  void SkipNextDepthTransfer() { skip_next_depth_transfer_ = true; }
+  // Whether the last Update took the depth render target over without transfers (SkipNextDepthTransfer).
+  bool last_update_depth_transfer_skipped() const { return last_update_depth_transfer_skipped_; }
+  // x360-native (3 Nov 2026): the next Update is for a stencil-only clear quad (no colour, depth untouched,
+  // stencil ALWAYS + REPLACE/ZERO with all bits). If one depth render target of the same format and pitch
+  // already owns the whole range the quad covers (in another MSAA mode - Army of Two clears stencil through a
+  // 4xMSAA alias of its 1x/2x depth buffer), Update changes nothing and reports that owner instead: the
+  // caller clears its stencil and skips the draw, so the depth is not copied into the alias and back.
+  void StencilClearInPlaceNextDepth(uint32_t stencil_value) {
+    stencil_clear_in_place_next_ = true;
+    stencil_clear_value_ = stencil_value;
+  }
+  uint32_t stencil_clear_value() const { return stencil_clear_value_; }
+  // Whether the last Update found such an owner (the draw must then be skipped).
+  bool last_update_stencil_cleared_in_place() const { return !last_update_stencil_clear_owner_.IsEmpty(); }
+
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
 
@@ -300,6 +318,18 @@ class RenderTargetCache {
    private:
     RenderTargetKey key_;
   };
+
+  // x360-native: the owner found for an in-place stencil clear by the last Update (empty key if none) and
+  // the length of the range the quad covers, in tiles from its base.
+  RenderTargetKey last_update_stencil_clear_owner() const { return last_update_stencil_clear_owner_; }
+  uint32_t last_update_stencil_clear_length_tiles() const {
+    return last_update_stencil_clear_length_tiles_;
+  }
+  // The existing render target with this key, or nullptr.
+  RenderTarget* FindRenderTarget(RenderTargetKey key) const {
+    auto it = render_targets_.find(key);
+    return it != render_targets_.end() ? it->second : nullptr;
+  }
 
   struct Transfer {
     uint32_t start_tiles;
@@ -660,6 +690,12 @@ class RenderTargetCache {
   // since standard containers use dynamic allocation for elements, though
   // changes to this throughout a frame are pretty rare.
   std::map<uint32_t, OwnershipRange> ownership_ranges_;
+  bool skip_next_depth_transfer_ = false;
+  bool last_update_depth_transfer_skipped_ = false;
+  bool stencil_clear_in_place_next_ = false;
+  uint32_t stencil_clear_value_ = 0;
+  RenderTargetKey last_update_stencil_clear_owner_;
+  uint32_t last_update_stencil_clear_length_tiles_ = 0;
 
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.

@@ -683,11 +683,87 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  bool stencil_clear_in_place = stencil_clear_in_place_next_;
+  stencil_clear_in_place_next_ = false;
+  last_update_stencil_clear_owner_ = RenderTargetKey();
+  last_update_stencil_clear_length_tiles_ = 0;
+  if (stencil_clear_in_place && !interlock_barrier_only && edram_bases_sorted_count == 1 &&
+      edram_bases_sorted[0].second == 0) {
+    const RenderTargetKey& quad_key = rt_keys[0];
+    uint32_t start = quad_key.base_tiles;
+    uint32_t end = start + rt_lengths_tiles[0];
+    RenderTargetKey owner;
+    if (rt_lengths_tiles[0] && end <= xenos::kEdramTileCount) {
+      // The map has no gaps and starts at 0: the range containing `start` is the one before upper_bound.
+      auto it = std::prev(ownership_ranges_.upper_bound(start));
+      owner = it->second.render_target;
+      for (; !owner.IsEmpty() && it != ownership_ranges_.end() && it->first < end; ++it) {
+        if (it->second.render_target != owner) {
+          owner = RenderTargetKey();
+        }
+      }
+    }
+    if (!owner.IsEmpty() && owner != quad_key && owner.is_depth && owner.base_tiles == start &&
+        owner.pitch_tiles_at_32bpp == quad_key.pitch_tiles_at_32bpp &&
+        owner.resource_format == quad_key.resource_format) {
+      last_update_stencil_clear_owner_ = owner;
+      last_update_stencil_clear_length_tiles_ = rt_lengths_tiles[0];
+      static uint32_t in_place_logged = 0;
+      if (in_place_logged < 16) {
+        ++in_place_logged;
+        REXSYS_INFO("stencil clear in place: {}xMSAA quad over {} tiles at {} -> owner {}xMSAA", 
+                    uint32_t(1) << uint32_t(quad_key.msaa_samples), rt_lengths_tiles[0], start,
+                    uint32_t(1) << uint32_t(owner.msaa_samples));
+      }
+      // Bindings and ownership stay as they are - the draw is not done.
+      return true;
+    }
+    static uint32_t in_place_rejects_logged = 0;
+    if (in_place_rejects_logged < 16) {
+      ++in_place_rejects_logged;
+      auto range = std::prev(ownership_ranges_.upper_bound(start));
+      REXSYS_INFO("stencil clear in place rejected: quad {} over {} tiles at {}; owner {}; range at {} is {} to {}",
+                  quad_key.GetDebugName(), rt_lengths_tiles[0], start,
+                  owner.IsEmpty() ? std::string("none (mixed or empty)") : owner.GetDebugName(), range->first,
+                  range->second.render_target.IsEmpty() ? std::string("empty")
+                                                        : range->second.render_target.GetDebugName(),
+                  range->second.end_tiles);
+    }
+  } else if (stencil_clear_in_place) {
+    static uint32_t in_place_skips_logged = 0;
+    if (in_place_skips_logged < 8) {
+      ++in_place_skips_logged;
+      REXSYS_INFO("stencil clear in place not tried: {} render targets, first index {}", edram_bases_sorted_count,
+                  edram_bases_sorted_count ? edram_bases_sorted[0].second : 99);
+    }
+  }
+
+  bool skip_depth_transfer = skip_next_depth_transfer_;
+  skip_next_depth_transfer_ = false;
+  last_update_depth_transfer_skipped_ = false;
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
+    bool skip_transfer = skip_depth_transfer && rt_bit_index == 0;
+    if (skip_transfer && !interlock_barrier_only) {
+      last_update_depth_transfer_skipped_ = true;
+      // The first skips are logged: the range taken over must be what the clear quad covers.
+      static uint32_t skips_logged = 0;
+      if (skips_logged < 64) {
+        ++skips_logged;
+        const RenderTargetKey& key = rt_keys[0];
+        REXSYS_INFO(
+            "clear transfer skip: depth fmt {} {}xMSAA pitch {} tiles base {} length {} tiles (height used {} "
+            "of {}, {} tiles at 32bpp) - {} transfer(s) dropped",
+            key.resource_format, uint32_t(1) << uint32_t(key.msaa_samples), key.pitch_tiles_at_32bpp,
+            key.base_tiles, rt_lengths_tiles[i], height_used,
+            GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples), length_used_tiles_at_32bpp,
+            WouldOwnershipChangeRequireTransfers(key, 0, rt_lengths_tiles[i]) ? "some" : "no");
+      }
+    }
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+                    (interlock_barrier_only || skip_transfer) ? nullptr
+                                                              : &last_update_transfers_[rt_bit_index]);
   }
 
   if (interlock_barrier_only) {
