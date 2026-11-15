@@ -25,6 +25,11 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+namespace rex::graphics {
+// command_processor.cpp: guest bytes uploaded per frame-stats window.
+void FrameStatsAddUpload(uint64_t bytes);
+}  // namespace rex::graphics
+
 namespace rex::graphics::d3d12 {
 
 D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
@@ -305,6 +310,9 @@ bool D3D12SharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
     return true;
+  }
+  for (auto upload_range : upload_page_ranges) {
+    FrameStatsAddUpload(uint64_t(upload_range.second) << page_size_log2());
   }
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
