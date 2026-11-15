@@ -57,17 +57,28 @@ class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
 
+  // Locks mutex(), first retrying try_lock for a short while (spin_count()
+  // rounds) before blocking. Most holders (the guest's interrupt-disable
+  // sections, REX_ENTER_GLOBAL_LOCK) release within microseconds, and a
+  // blocked waiter costs a kernel sleep and wake on each side.
+  static void LockSpin();
+  // REX_GLOBAL_LOCK_SPIN in the environment (read once); default 100 on PS5,
+  // 0 elsewhere. 0 = plain lock().
+  static int spin_count();
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
+    LockSpin();
+    return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
   }
 
   // Acquires a lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> Acquire() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
+    LockSpin();
+    return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
   }
 
   // Acquires a deferred lock on the global critical section.

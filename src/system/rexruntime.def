@@ -211,6 +211,8 @@ EXPORTS
 ?lzcnt@rex@@YAEI@Z
 ?lzcnt@rex@@YAE_K@Z
 ?mutex@global_critical_region@thread@rex@@SAAEAVrecursive_mutex@std@@XZ
+?LockSpin@global_critical_region@thread@rex@@SAXXZ
+?spin_count@global_critical_region@thread@rex@@SAHXZ
 ?page_size@memory@rex@@YA_KXZ
 ?path_to_utf8@rex@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@AEBVpath@filesystem@3@@Z
 ?set_name@XThread@system@rex@@QEAAXV?$basic_string_view@DU?$char_traits@D@std@@@std@@@Z

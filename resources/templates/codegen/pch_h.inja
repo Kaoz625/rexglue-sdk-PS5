@@ -331,7 +331,7 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
 
 #define REX_ENTER_GLOBAL_LOCK()                          \
   do {                                                   \
-    rex::thread::global_critical_region::mutex().lock(); \
+    rex::thread::global_critical_region::LockSpin();    \
     ppc_global_lock_count_().fetch_add(1);               \
   } while (0)
 
