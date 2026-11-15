@@ -1111,6 +1111,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
   inline void post_execution() override {
+    // Runs after EVERY successful wait on the thread (several waiters, or one waiting twice): join and clean up once.
+    // A second pthread_join of the same thread is undefined; glibc returns an error, bionic aborts ("invalid
+    // pthread_t passed to pthread_join", Army of Two on Android 15 Nov 2026).
+    if (post_executed_) return;
+    post_executed_ = true;
     if (thread_) {
       pthread_join(thread_, nullptr);
     }
@@ -1125,6 +1130,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
   }
   pthread_t thread_;
   bool signaled_;
+  bool post_executed_ = false;
   int exit_code_;
   State state_;             // Protected by state_mutex_
   uint32_t suspend_count_;  // Protected by state_mutex_
