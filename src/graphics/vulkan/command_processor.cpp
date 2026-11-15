@@ -9,7 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#define REX_CPU_PAUSE() _mm_pause()
+#elif defined(__aarch64__)
+#define REX_CPU_PAUSE() __asm__ __volatile__("yield")
+#else
+#define REX_CPU_PAUSE() ((void)0)
+#endif
 #include <thread>
 #include <bit>
 #include <optional>
@@ -3789,7 +3796,7 @@ void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
       account_wait();
       return;
     }
-    _mm_pause();
+    REX_CPU_PAUSE();
   }
   if (is_drain) {
     ++encode_wait_counts_[3];
@@ -3930,7 +3937,7 @@ void VulkanCommandProcessor::EncodeThreadMain() {
       // spin a little before sleeping.
       bool woke = false;
       for (uint32_t i = 0; i < 4096; ++i) {
-        _mm_pause();
+        REX_CPU_PAUSE();
         if (has_work()) {
           woke = true;
           break;
