@@ -47,6 +47,32 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+// x360-native: a typed colour render target lets the driver compress it (AMD DCC); typeless ones mostly are
+// not. On the Xbox One S, Army of Two's 2xMSAA 7e3 scene target shows a screen-aligned checker (one shader
+// engine's tiles lose red) - true creates 8888 / 2_10_10_10 / 7e3 targets typeless to test that.
+// x360-native (30 Oct 2026): on the Xbox One S (AMD GCN), a depth/stencil target whose stencil was written by
+// an ownership transfer kept stale per-8x8-tile stencil metadata (HiS/HTILE): a later stencil-tested draw was
+// rejected in alternate tiles (Army of Two's shadow mask -> screen-aligned checker). Sending the target
+// through a read state after transfers makes the driver resolve its metadata.
+REXCVAR_DECLARE(int32_t, skip_clear_draw_transfers);
+REXCVAR_DEFINE_BOOL(d3d12_depth_transfer_decompress, false, "GPU/D3D12",
+                    "After ownership transfers into a depth/stencil target, transition it through "
+                    "DEPTH_READ (forces the driver to rebuild per-tile depth/stencil metadata)");
+// x360-native (3 Nov 2026): on the Xbox One S one depth resolve clear per Army of Two menu frame costs ~9 ms
+// of a 32 ms GPU frame. A rectangle clear of part of a target can't use the AMD fast (metadata-only) clear;
+// true clears the whole target when the rectangle starts at its top-left and spans its width (the rows below
+// are other EDRAM rows this target holds, which the game is assumed not to read back) - an A/B switch.
+REXCVAR_DEFINE_BOOL(d3d12_depth_clear_whole, false, "GPU/D3D12",
+                    "Resolve clears of a depth target that start at its top-left and span its width clear "
+                    "the whole target (fast clear) instead of a rectangle");
+
+REXCVAR_DEFINE_BOOL(d3d12_color_transfer_decompress, false, "GPU/D3D12",
+                    "After ownership transfers into a colour target, transition it through "
+                    "PIXEL_SHADER_RESOURCE and back (forces the driver to rebuild DCC/CMask metadata; "
+                    "x360-native, Army of Two rainbow speckle test)");
+REXCVAR_DEFINE_BOOL(d3d12_typeless_color_render_targets, false, "GPU/D3D12",
+                    "Create 8888, 2_10_10_10 and 7e3 colour render targets typeless (no colour compression)");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -1056,6 +1082,8 @@ void D3D12RenderTargetCache::BeginSubmission() {
   }
 }
 
+void PassTimerMark(DeferredCommandList& list, std::string what);  // command_processor.cpp
+
 bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
                                     reg::RB_DEPTHCONTROL normalized_depth_control,
                                     uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -1065,10 +1093,87 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
   }
   switch (GetPath()) {
     case Path::kHostRenderTargets: {
+      RenderTargetKey stencil_owner_key = last_update_stencil_clear_owner();
+      if (!stencil_owner_key.IsEmpty()) {
+        // skip_clear_draw_transfers = 3: a stencil-only clear quad on another MSAA alias of the depth buffer -
+        // clear the stencil of the render target that holds the range (whole rows of tiles from its base).
+        RenderTarget* owner = FindRenderTarget(stencil_owner_key);
+        if (!owner) {
+          return false;
+        }
+        auto& owner_rt = *static_cast<D3D12RenderTarget*>(owner);
+        uint32_t pitch = stencil_owner_key.pitch_tiles_at_32bpp;
+        uint32_t rows = (last_update_stencil_clear_length_tiles() + pitch - 1) / pitch;
+        bool msaa_2x_or_more = stencil_owner_key.msaa_samples >= xenos::MsaaSamples::k2X;
+        bool msaa_4x = stencil_owner_key.msaa_samples >= xenos::MsaaSamples::k4X;
+        D3D12_RECT rect;
+        rect.left = 0;
+        rect.top = 0;
+        rect.right = LONG(((pitch * xenos::kEdramTileWidthSamples) >> uint32_t(msaa_4x)) *
+                          draw_resolution_scale_x());
+        rect.bottom = LONG(((rows * xenos::kEdramTileHeightSamples) >> uint32_t(msaa_2x_or_more)) *
+                           draw_resolution_scale_y());
+        PassTimerMark(command_processor_.GetDeferredCommandList(),
+                      fmt::format("stencil clear in place {} = {} rect 0,0-{},{}",
+                                  stencil_owner_key.GetDebugName(), stencil_clear_value(), rect.right,
+                                  rect.bottom));
+        command_processor_.PushTransitionBarrier(
+            owner_rt.resource(), owner_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        command_processor_.SubmitBarriers();
+        command_processor_.GetDeferredCommandList().D3DClearDepthStencilView(
+            owner_rt.descriptor_draw().GetHandle(), D3D12_CLEAR_FLAG_STENCIL, 0.0f,
+            UINT8(stencil_clear_value()), 1, &rect);
+        // A DSV clear needs no binding - the bound render targets stay as they were.
+        break;
+      }
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
+      if (REXCVAR_GET(d3d12_depth_transfer_decompress) && depth_and_color_render_targets[0] &&
+          !last_update_transfers()[0].empty()) {
+        auto& depth_rt = *static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0]);
+        constexpr D3D12_RESOURCE_STATES kRead =
+            D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        command_processor_.PushTransitionBarrier(depth_rt.resource(), depth_rt.SetResourceState(kRead),
+                                                 kRead);
+        // Separate barrier batches, so the driver cannot fold the round trip into nothing.
+        command_processor_.SubmitBarriers();
+        command_processor_.PushTransitionBarrier(
+            depth_rt.resource(), depth_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+      }
+      if (REXCVAR_GET(d3d12_color_transfer_decompress)) {
+        for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if (!depth_and_color_render_targets[i] || last_update_transfers()[i].empty()) {
+            continue;
+          }
+          auto& color_rt = *static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[i]);
+          constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          command_processor_.PushTransitionBarrier(color_rt.resource(), color_rt.SetResourceState(kRead),
+                                                   kRead);
+          command_processor_.SubmitBarriers();
+          command_processor_.PushTransitionBarrier(
+              color_rt.resource(), color_rt.SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET),
+              D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+      }
+      // skip_clear_draw_transfers = 2: the depth render target taken over without a copy gets a plain clear
+      // instead, so wherever the game's clear quad does not reach shows as depth 0 (everything fails the
+      // depth test there) rather than whatever the host texture held before. A DSV clear is far cheaper
+      // than the EDRAM-format transfer it replaces.
+      if (depth_and_color_render_targets[0] && last_update_depth_transfer_skipped() &&
+          REXCVAR_GET(skip_clear_draw_transfers) >= 2) {
+        auto& depth_rt = *static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0]);
+        command_processor_.PushTransitionBarrier(
+            depth_rt.resource(), depth_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        command_processor_.SubmitBarriers();
+        command_processor_.GetDeferredCommandList().D3DClearDepthStencilView(
+            depth_rt.descriptor_draw().GetHandle(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f,
+            0, 0, nullptr);
+      }
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     case Path::kPixelShaderInterlock: {
@@ -1197,6 +1302,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
+          uint32_t span_base, span_row_length, span_rows, span_pitch;
+          resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
+          PassTimerMark(command_list, fmt::format("resolve dump: base {} rows {} x {} tiles pitch {}", span_base,
+                                                  span_rows, span_row_length, span_pitch));
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1300,6 +1409,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
           command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
+          PassTimerMark(command_list, fmt::format("resolve copy: shader {} groups {}x{}", uint32_t(copy_shader),
+                                                  copy_group_count_x, copy_group_count_y));
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Order the resolve with other work using the destination as a UAV.
@@ -1331,6 +1442,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
   if (clear_depth || clear_color) {
+    PassTimerMark(command_list, fmt::format("resolve clear:{}{}", clear_depth ? " depth" : "",
+                                            clear_color ? " color" : ""));
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
         Transfer::Rectangle clear_rectangle;
@@ -1421,6 +1534,23 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorResourceDXGIFormat(
     xenos::ColorRenderTargetFormat format) const {
   // Typed should be preferred over typeless so there are more opportunities for
   // compression.
+  if (REXCVAR_GET(d3d12_typeless_color_render_targets)) {
+    switch (format) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        return gamma_render_target_as_unorm16_ ? DXGI_FORMAT_R16G16B16A16_TYPELESS
+                                               : DXGI_FORMAT_R8G8B8A8_TYPELESS;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+      default:
+        break;
+    }
+  }
   switch (format) {
     case xenos::ColorRenderTargetFormat::k_8_8_8_8:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1471,6 +1601,18 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorDrawDXGIFormat(
       return DXGI_FORMAT_R32_FLOAT;
     case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
       return DXGI_FORMAT_R32G32_FLOAT;
+    // Typed even when the resource is typeless (d3d12_typeless_color_render_targets).
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+      return gamma_render_target_as_unorm16_ ? DXGI_FORMAT_R16G16B16A16_UNORM
+                                             : DXGI_FORMAT_R8G8B8A8_UNORM;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+      return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
     default:
       return GetColorResourceDXGIFormat(format);
   }
@@ -3806,6 +3948,26 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  // Pass timing: name this group of transfers (what goes into what, how many tiles), so the "switch" passes
+  // that cost 18 ms of the One S frame (1 Nov 2026) say which ownership moves they are.
+  {
+    std::string what;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (!render_targets[i] || render_target_transfers[i].empty()) {
+        continue;
+      }
+      what += fmt::format("{}{} <-", what.empty() ? "transfers: " : " | ",
+                          render_targets[i]->key().GetDebugName());
+      for (const Transfer& transfer : render_target_transfers[i]) {
+        what += fmt::format(" [{}t from {}{}]", transfer.end_tiles - transfer.start_tiles,
+                            transfer.source ? transfer.source->key().GetDebugName() : std::string("?"),
+                            transfer.host_depth_source ? " +host depth" : "");
+      }
+    }
+    if (!what.empty()) {
+      PassTimerMark(command_list, std::move(what));
+    }
+  }
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
@@ -4571,10 +4733,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
             D3D12_RESOURCE_STATE_DEPTH_WRITE);
         command_processor_.SubmitBarriers();
+        D3D12_RESOURCE_DESC dest_desc = dest_d3d12_rt.resource()->GetDesc();
+        bool clear_whole = REXCVAR_GET(d3d12_depth_clear_whole) && !clear_rect.left && !clear_rect.top &&
+                           UINT64(clear_rect.right) >= dest_desc.Width;
+        PassTimerMark(command_list,
+                      fmt::format("depth clear {} rect {},{}-{},{} of {}x{}{}", dest_rt_key.GetDebugName(),
+                                  clear_rect.left, clear_rect.top, clear_rect.right, clear_rect.bottom,
+                                  dest_desc.Width, dest_desc.Height, clear_whole ? " whole" : ""));
         command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
                                               D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                                              depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
-                                              &clear_rect);
+                                              depth_host_clear_value, UINT(clear_value) & 0xFF,
+                                              clear_whole ? 0 : 1, clear_whole ? nullptr : &clear_rect);
       } else {
         float color_clear_value[4] = {};
         bool clear_via_drawing = false;
