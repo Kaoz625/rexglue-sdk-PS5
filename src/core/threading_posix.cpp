@@ -37,6 +37,7 @@ static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 #include <unistd.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/logging.h>
 #include <rex/thread/timer_queue.h>
@@ -72,6 +73,13 @@ static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 #else
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
+
+REXCVAR_DEFINE_UINT32(wait_spin_us, 0, "Kernel",
+                      "Before an event/semaphore wait blocks in the kernel, check it for up "
+                      "to this many microseconds. A wait signalled in that time costs no "
+                      "kernel sleep and wake. 0 = off.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::thread {
 
@@ -303,6 +311,28 @@ class PosixConditionBase {
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
+    // Optional short spin (wait_spin_us) before blocking: fine-grained job
+    // systems signal most waits within microseconds, and a wait that never
+    // sleeps also spares the signalling thread a kernel wake.
+    if (const uint32_t spin_us = REXCVAR_GET(wait_spin_us);
+        spin_us && timeout.count() != 0) {
+      const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+      uint32_t round = 0;
+      do {
+        if (mutex_.try_lock()) {
+          std::unique_lock<std::mutex> lock(mutex_, std::adopt_lock);
+          if (predicate()) {
+            post_execution();
+            return WaitResult::kSuccess;
+          }
+        }
+        for (int k = 0; k < 32; ++k) {
+#if defined(__x86_64__) || defined(_M_X64)
+          __builtin_ia32_pause();
+#endif
+        }
+      } while ((++round & 7) || std::chrono::steady_clock::now() < spin_end);
+    }
 #if REX_PLATFORM_LINUX
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
