@@ -2634,15 +2634,23 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           guest_output_width, guest_output_height);
     }
   }
-  if (texture_cache_->IsDrawResolutionScaled() && !swap_source_scaled) {
-    static bool draw_scale_swap_unscaled_logged = false;
-    if (!draw_scale_swap_unscaled_logged) {
-      draw_scale_swap_unscaled_logged = true;
-      REXGPU_WARN(
-          "Vulkan draw resolution scaling is enabled, but the swap source is "
-          "unscaled ({}x{}). This title may be presenting from an unscaled "
-          "resolve path.",
-          frontbuffer_width_scaled, frontbuffer_height_scaled);
+  if (texture_cache_->IsDrawResolutionScaled()) {
+    // Log every change between scaled and unscaled swap sources (up to 64
+    // times), not just the first unscaled frame: boot logos and movies come
+    // from CPU-written frontbuffers, gameplay from scaled resolves.
+    static int last_swap_source_scaled = -1;
+    static uint32_t swap_source_changes_logged = 0;
+    static uint64_t swap_count = 0;
+    ++swap_count;
+    if (int(swap_source_scaled) != last_swap_source_scaled && swap_source_changes_logged < 64) {
+      last_swap_source_scaled = int(swap_source_scaled);
+      ++swap_source_changes_logged;
+      REXGPU_WARN("Vulkan draw-scale swap source {} at swap {}: {}x{} (unscaled {}x{}, "
+                  "packet {}x{})",
+                  swap_source_scaled ? "SCALED" : "unscaled", swap_count,
+                  frontbuffer_width_scaled, frontbuffer_height_scaled,
+                  frontbuffer_width_unscaled, frontbuffer_height_unscaled, frontbuffer_width,
+                  frontbuffer_height);
     }
   }
   REXGPU_DEBUG(
