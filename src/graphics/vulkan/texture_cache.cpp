@@ -675,7 +675,33 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+  static_assert(sizeof(fetch) == sizeof(SamplerParametersCacheEntry::fetch));
+  const uint32_t binding_filters = uint32_t(binding.mag_filter) |
+                                   (uint32_t(binding.min_filter) << 8) |
+                                   (uint32_t(binding.mip_filter) << 16) |
+                                   (uint32_t(binding.aniso_filter) << 24);
+  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  const uint32_t slot = binding.fetch_constant & 31;
+  for (const SamplerParametersCacheEntry& entry : sampler_parameters_cache_[slot]) {
+    if (entry.valid && entry.binding_filters == binding_filters &&
+        entry.anisotropic_override == anisotropic_override &&
+        !std::memcmp(entry.fetch, &fetch, sizeof(entry.fetch))) {
+      return entry.parameters;
+    }
+  }
+  uint8_t& next_way = sampler_parameters_cache_next_[slot];
+  SamplerParametersCacheEntry& entry = sampler_parameters_cache_[slot][next_way];
+  next_way = uint8_t((next_way + 1) % kSamplerParametersCacheWays);
+  std::memcpy(entry.fetch, &fetch, sizeof(entry.fetch));
+  entry.binding_filters = binding_filters;
+  entry.anisotropic_override = anisotropic_override;
+  entry.parameters = ComputeSamplerParameters(binding, fetch);
+  entry.valid = true;
+  return entry.parameters;
+}
 
+VulkanTextureCache::SamplerParameters VulkanTextureCache::ComputeSamplerParameters(
+    const VulkanShader::SamplerBinding& binding, const xenos::xe_gpu_texture_fetch_t& fetch) const {
   SamplerParameters parameters;
 
   xenos::ClampMode fetch_clamp_x, fetch_clamp_y, fetch_clamp_z;

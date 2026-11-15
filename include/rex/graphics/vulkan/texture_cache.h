@@ -90,6 +90,13 @@ class VulkanTextureCache final : public TextureCache {
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
+  void ClearSamplerParametersCache() const {
+    for (auto& slot_cache : sampler_parameters_cache_) {
+      for (SamplerParametersCacheEntry& entry : slot_cache) {
+        entry.valid = false;
+      }
+    }
+  }
 
   // Must be called for every used sampler at least once in a single submission,
   // and a submission must be open for this to be callable.
@@ -380,6 +387,25 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t sampler_max_count_;
 
   xenos::AnisoFilter max_anisotropy_;
+  // GetSamplerParameters results per fetch constant slot, by the raw fetch
+  // constant and the binding's filter overrides: the derivation includes the
+  // texture key / signs and mip range (BindingInfoFromFetchConstant,
+  // GetSubresourcesFromFetchConstant, GetHostFormatPair), redone for every
+  // sampler of almost every draw because fetch constants change all the time,
+  // though each slot cycles through a few values.
+  struct SamplerParametersCacheEntry {
+    uint32_t fetch[6];
+    uint32_t binding_filters;
+    int32_t anisotropic_override;
+    bool valid = false;
+    SamplerParameters parameters;
+  };
+  static constexpr uint32_t kSamplerParametersCacheWays = 4;
+  mutable std::array<std::array<SamplerParametersCacheEntry, kSamplerParametersCacheWays>, 32>
+      sampler_parameters_cache_;
+  mutable std::array<uint8_t, 32> sampler_parameters_cache_next_{};
+  SamplerParameters ComputeSamplerParameters(const VulkanShader::SamplerBinding& binding,
+                                             const xenos::xe_gpu_texture_fetch_t& fetch) const;
 
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
