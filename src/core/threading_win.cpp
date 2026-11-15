@@ -15,6 +15,10 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <spdlog/spdlog.h>
 
+#include <climits>
+#include <memory>
+#include <vector>
+
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
 
@@ -139,7 +143,268 @@ class Win32Handle : public T {
   HANDLE handle_ = nullptr;
 };
 
+// Deterministic Pulse (x360-native, rexglue-pulse-deterministic.patch).
+//
+// Win32 PulseEvent is documented as unreliable: a thread that is momentarily removed from its wait
+// (a kernel-mode APC, a debugger, SuspendThread/GetThreadContext) when the pulse lands is not
+// released, and the event is already non-signaled when it re-enters the wait. Games that only ever
+// pulse an event then hang forever - Army of Two's UE3 FRenderCommandFence waits INFINITE on an event
+// the render thread only pulses (NtPulseEvent/KePulseEvent -> XEvent::Pulse -> Event::Pulse).
+//
+// Here every event wait with a non-zero timeout registers with the event's current PulseGate: a
+// private manual-reset Win32 event that is added to the wait (ahead of the real event). Pulse() fires
+// the current gate (SetEvent, never reset) and starts a new generation for later waiters. Because the
+// fired gate stays signaled, a waiter that was out of its wait at that instant still finds it when it
+// re-enters, so no current waiter is lost; a waiter that registers after the pulse holds the next gate
+// and does not see it. Releases are counted in the gate: manual-reset releases every waiter of that
+// generation, auto-reset hands out exactly one token - the first waiter to claim it returns success,
+// the others re-register with the new gate and keep waiting with what is left of their timeout. The
+// real event is left non-signaled, as PulseEvent leaves it. Set/Reset/Pulse and gate bookkeeping are
+// serialized by one SRW lock per event.
+//
+// Waits that cannot carry a gate (WaitAll, a WaitAny that would pass MAXIMUM_WAIT_OBJECTS, or a
+// failed gate allocation) register as "plain" waiters and Pulse() keeps the old PulseEvent for them.
+// Zero-timeout polls do not register at all (a pulse can never be observed by a poll).
+struct PulseGate {
+  explicit PulseGate(HANDLE handle) : handle(handle) {}
+  ~PulseGate() { CloseHandle(handle); }
+  PulseGate(const PulseGate&) = delete;
+  PulseGate& operator=(const PulseGate&) = delete;
+  HANDLE handle;
+  // Releases left in this generation once fired: 1 (auto-reset), INT_MAX (manual-reset). Guarded by
+  // the owning event's lock.
+  int tokens = 0;
+};
+
+class Win32Event : public Win32Handle<Event> {
+ public:
+  Win32Event(HANDLE handle, bool manual_reset)
+      : Win32Handle(handle), manual_reset_(manual_reset) {}
+  ~Win32Event() override = default;
+
+  void Set() override {
+    AcquireSRWLockExclusive(&lock_);
+    SetEvent(handle_);
+    ReleaseSRWLockExclusive(&lock_);
+  }
+  void Reset() override {
+    AcquireSRWLockExclusive(&lock_);
+    ResetEvent(handle_);
+    ReleaseSRWLockExclusive(&lock_);
+  }
+  void Pulse() override {
+    AcquireSRWLockExclusive(&lock_);
+    bool released = false;
+    if (gate_ && gate_waiters_) {
+      gate_->tokens = manual_reset_ ? INT_MAX : 1;
+      SetEvent(gate_->handle);
+      gate_.reset();
+      gate_waiters_ = 0;
+      released = true;
+    }
+    if (plain_waiters_ && (manual_reset_ || !released)) {
+      PulseEvent(handle_);  // best effort for waits that could not carry a gate
+    } else {
+      ResetEvent(handle_);
+    }
+    ReleaseSRWLockExclusive(&lock_);
+  }
+
+  // Joins the current pulse generation; nullptr if no gate could be made (then use plain).
+  std::shared_ptr<PulseGate> RegisterGateWaiter() {
+    AcquireSRWLockExclusive(&lock_);
+    if (!gate_) {
+      HANDLE gate_handle =
+          CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
+      if (gate_handle) {
+        gate_ = std::make_shared<PulseGate>(gate_handle);
+      } else {
+        LOG_LASTERROR();
+      }
+    }
+    std::shared_ptr<PulseGate> gate = gate_;
+    if (gate) {
+      ++gate_waiters_;
+    }
+    ReleaseSRWLockExclusive(&lock_);
+    return gate;
+  }
+  void UnregisterGateWaiter(const std::shared_ptr<PulseGate>& gate) {
+    AcquireSRWLockExclusive(&lock_);
+    if (gate == gate_ && gate_waiters_) {
+      --gate_waiters_;
+    }
+    ReleaseSRWLockExclusive(&lock_);
+  }
+  // A waiter woke on a fired gate: true if it is one of the waiters that pulse releases.
+  bool ClaimPulse(const std::shared_ptr<PulseGate>& gate) {
+    AcquireSRWLockExclusive(&lock_);
+    bool claimed = false;
+    if (gate->tokens > 0) {
+      if (!manual_reset_) {
+        --gate->tokens;
+      }
+      claimed = true;
+    }
+    ReleaseSRWLockExclusive(&lock_);
+    return claimed;
+  }
+  void RegisterPlainWaiter() {
+    AcquireSRWLockExclusive(&lock_);
+    ++plain_waiters_;
+    ReleaseSRWLockExclusive(&lock_);
+  }
+  void UnregisterPlainWaiter() {
+    AcquireSRWLockExclusive(&lock_);
+    --plain_waiters_;
+    ReleaseSRWLockExclusive(&lock_);
+  }
+
+ private:
+  const bool manual_reset_;
+  SRWLOCK lock_ = SRWLOCK_INIT;
+  std::shared_ptr<PulseGate> gate_;  // current (unfired) generation, made on first waiter
+  uint32_t gate_waiters_ = 0;        // waiters holding gate_
+  uint32_t plain_waiters_ = 0;       // waiters without a gate (WaitAll etc.)
+};
+
+namespace {
+
+Win32Event* AsWin32Event(WaitHandle* wait_handle) {
+  return dynamic_cast<Win32Event*>(wait_handle);
+}
+
+bool HasWin32Event(WaitHandle* const wait_handles[], size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    if (AsWin32Event(wait_handles[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Registers plain waiters for the events in a wait that cannot carry gates, for its lifetime.
+class PlainWaitScope {
+ public:
+  PlainWaitScope(WaitHandle* const wait_handles[], size_t count, bool active) {
+    if (!active) {
+      return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+      if (auto event = AsWin32Event(wait_handles[i])) {
+        event->RegisterPlainWaiter();
+        events_.push_back(event);
+      }
+    }
+  }
+  ~PlainWaitScope() {
+    for (auto event : events_) {
+      event->UnregisterPlainWaiter();
+    }
+  }
+
+ private:
+  std::vector<Win32Event*> events_;
+};
+
+// WaitAny where every Win32Event also waits on its pulse gate. first_gate, when given, is a gate the
+// caller already registered for wait_handles[0] (SignalAndWait); it is used and released here.
+std::pair<WaitResult, size_t> GatedWaitAny(WaitHandle* const wait_handles[], size_t count,
+                                           bool is_alertable, DWORD timeout_ms,
+                                           std::shared_ptr<PulseGate> first_gate = nullptr) {
+  const ULONGLONG start = GetTickCount64();
+  struct Slot {
+    Win32Event* event = nullptr;
+    std::shared_ptr<PulseGate> gate;
+    bool plain = false;
+  };
+  std::vector<Slot> slots(count);
+  std::vector<HANDLE> handles;
+  std::vector<size_t> owner;     // handles[k] belongs to wait_handles[owner[k]]
+  std::vector<bool> is_gate;     // handles[k] is that handle's pulse gate
+  handles.reserve(MAXIMUM_WAIT_OBJECTS);
+  for (;;) {
+    handles.clear();
+    owner.clear();
+    is_gate.clear();
+    for (size_t i = 0; i < count; ++i) {
+      Slot& slot = slots[i];
+      slot.event = AsWin32Event(wait_handles[i]);
+      if (slot.event) {
+        // Room for this gate + this handle + one handle for every later entry.
+        bool room = handles.size() + 2 + (count - i - 1) <= MAXIMUM_WAIT_OBJECTS;
+        if (i == 0 && first_gate) {
+          slot.gate = std::move(first_gate);
+        } else if (room) {
+          slot.gate = slot.event->RegisterGateWaiter();
+        }
+        if (slot.gate) {
+          handles.push_back(slot.gate->handle);
+          owner.push_back(i);
+          is_gate.push_back(true);
+        } else {
+          slot.event->RegisterPlainWaiter();
+          slot.plain = true;
+        }
+      }
+      handles.push_back(wait_handles[i]->native_handle());
+      owner.push_back(i);
+      is_gate.push_back(false);
+    }
+
+    DWORD wait_ms = timeout_ms;
+    if (timeout_ms != INFINITE) {
+      ULONGLONG elapsed = GetTickCount64() - start;
+      wait_ms = elapsed >= timeout_ms ? 0 : DWORD(timeout_ms - elapsed);
+    }
+    DWORD result = WaitForMultipleObjectsEx(DWORD(handles.size()), handles.data(), FALSE, wait_ms,
+                                            is_alertable ? TRUE : FALSE);
+
+    for (auto& slot : slots) {
+      if (slot.gate) {
+        slot.event->UnregisterGateWaiter(slot.gate);
+      } else if (slot.plain) {
+        slot.event->UnregisterPlainWaiter();
+      }
+      slot.plain = false;
+    }
+
+    if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + handles.size()) {
+      size_t k = result - WAIT_OBJECT_0;
+      size_t i = owner[k];
+      if (!is_gate[k] || slots[i].event->ClaimPulse(slots[i].gate)) {
+        for (auto& slot : slots) slot.gate.reset();
+        return {WaitResult::kSuccess, i};
+      }
+      // Auto-reset pulse already taken by another waiter of that generation: keep waiting.
+      for (auto& slot : slots) slot.gate.reset();
+      if (timeout_ms != INFINITE && GetTickCount64() - start >= timeout_ms) {
+        return {WaitResult::kTimeout, 0};
+      }
+      continue;
+    }
+    for (auto& slot : slots) slot.gate.reset();
+    if (result >= WAIT_ABANDONED_0 && result < WAIT_ABANDONED_0 + handles.size()) {
+      return {WaitResult::kAbandoned, owner[result - WAIT_ABANDONED_0]};
+    }
+    switch (result) {
+      case WAIT_IO_COMPLETION:
+        return {WaitResult::kUserCallback, 0};
+      case WAIT_TIMEOUT:
+        return {WaitResult::kTimeout, 0};
+      default:
+      case WAIT_FAILED:
+        return {WaitResult::kFailed, 0};
+    }
+  }
+}
+
+}  // namespace
+
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
+  if (DWORD(timeout.count()) != 0 && AsWin32Event(wait_handle)) {
+    return GatedWaitAny(&wait_handle, 1, is_alertable, DWORD(timeout.count())).first;
+  }
   HANDLE handle = wait_handle->native_handle();
   DWORD result = WaitForSingleObjectEx(handle, DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
   switch (result) {
@@ -161,6 +426,31 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
                          bool is_alertable, std::chrono::milliseconds timeout) {
   HANDLE handle_to_signal = wait_handle_to_signal->native_handle();
   HANDLE handle_to_wait_on = wait_handle_to_wait_on->native_handle();
+  if (auto event = DWORD(timeout.count()) != 0 ? AsWin32Event(wait_handle_to_wait_on) : nullptr) {
+    // Join the pulse generation before signaling (a pulse sent in reply to our signal must reach
+    // us), signal and poll in one call, then wait on the event and its gate.
+    if (auto gate = event->RegisterGateWaiter()) {
+      DWORD polled = SignalObjectAndWait(handle_to_signal, handle_to_wait_on, 0,
+                                         is_alertable ? TRUE : FALSE);
+      if (polled == WAIT_TIMEOUT) {
+        return GatedWaitAny(&wait_handle_to_wait_on, 1, is_alertable, DWORD(timeout.count()),
+                            std::move(gate))
+            .first;
+      }
+      event->UnregisterGateWaiter(gate);
+      switch (polled) {
+        case WAIT_OBJECT_0:
+          return WaitResult::kSuccess;
+        case WAIT_ABANDONED:
+          return WaitResult::kAbandoned;
+        case WAIT_IO_COMPLETION:
+          return WaitResult::kUserCallback;
+        default:
+        case WAIT_FAILED:
+          return WaitResult::kFailed;
+      }
+    }
+  }
   DWORD result = SignalObjectAndWait(handle_to_signal, handle_to_wait_on, DWORD(timeout.count()),
                                      is_alertable ? TRUE : FALSE);
   switch (result) {
@@ -181,6 +471,12 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wait_handle_count,
                                            bool wait_all, bool is_alertable,
                                            std::chrono::milliseconds timeout) {
+  const bool has_event = DWORD(timeout.count()) != 0 && HasWin32Event(wait_handles, wait_handle_count);
+  if (has_event && !wait_all) {
+    return GatedWaitAny(wait_handles, wait_handle_count, is_alertable, DWORD(timeout.count()));
+  }
+  // WaitAll keeps the native wait; a pulse reaches it through PulseEvent as before.
+  PlainWaitScope plain_waiters(wait_handles, wait_handle_count, has_event);
   std::vector<HANDLE> handles(wait_handle_count);
   for (size_t i = 0; i < wait_handle_count; ++i) {
     handles[i] = wait_handles[i]->native_handle();
@@ -204,19 +500,10 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
   }
 }
 
-class Win32Event : public Win32Handle<Event> {
- public:
-  explicit Win32Event(HANDLE handle) : Win32Handle(handle) {}
-  ~Win32Event() override = default;
-  void Set() override { SetEvent(handle_); }
-  void Reset() override { ResetEvent(handle_); }
-  void Pulse() override { PulseEvent(handle_); }
-};
-
 std::unique_ptr<Event> Event::CreateManualResetEvent(bool initial_state) {
   HANDLE handle = CreateEvent(nullptr, TRUE, initial_state ? TRUE : FALSE, nullptr);
   if (handle) {
-    return std::make_unique<Win32Event>(handle);
+    return std::make_unique<Win32Event>(handle, true);
   } else {
     LOG_LASTERROR();
     return nullptr;
@@ -226,7 +513,7 @@ std::unique_ptr<Event> Event::CreateManualResetEvent(bool initial_state) {
 std::unique_ptr<Event> Event::CreateAutoResetEvent(bool initial_state) {
   HANDLE handle = CreateEvent(nullptr, FALSE, initial_state ? TRUE : FALSE, nullptr);
   if (handle) {
-    return std::make_unique<Win32Event>(handle);
+    return std::make_unique<Win32Event>(handle, false);
   } else {
     LOG_LASTERROR();
     return nullptr;
