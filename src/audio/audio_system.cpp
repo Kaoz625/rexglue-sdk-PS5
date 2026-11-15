@@ -272,7 +272,17 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  assert_true(clients_[index].driver != NULL);
+  if (!clients_[index].driver) {
+    // No host audio device (an Android emulator started with -no-audio, a TV box without output): drop the frame
+    // and hand the guest its buffer back, as a silent driver would, instead of calling through null.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXAPU_WARN("AudioSystem: no audio driver for client {}; frames are dropped (silent)", index);
+    }
+    client_semaphores_[index]->Release(1, nullptr);
+    return;
+  }
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
