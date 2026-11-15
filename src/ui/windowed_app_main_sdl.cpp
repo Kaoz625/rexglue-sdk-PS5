@@ -135,7 +135,17 @@ int main(int argc, char* argv[]) {
 #if REX_PLATFORM_ANDROID
 // Android: SDL's activity loads libmain.so and calls SDL_main by name (dlsym), so it must be exported; the app's
 // libraries are built with hidden visibility.
+namespace rex::memory {
+void AndroidInitialize();
+}
+namespace rex::thread {
+void AndroidInitialize();
+}
 extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
+  // xenia's Android setup (its own main_android did this): ASharedMemory_create for the guest memory mapping,
+  // pthread_getname_np for thread names, both looked up at run time.
+  rex::memory::AndroidInitialize();
+  rex::thread::AndroidInitialize();
   return main(argc, argv);
 }
 #endif
