@@ -61,6 +61,9 @@ class PipelineCache {
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking);
+  // x360-native: the body of InitializeShaderStorage, which wraps it in a step trace and try/catch.
+  void InitializeShaderStorageSteps(const std::filesystem::path& cache_root, uint32_t title_id,
+                               bool blocking);
   void ShutdownShaderStorage();
 
   void EndSubmission();
