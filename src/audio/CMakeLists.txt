@@ -15,6 +15,10 @@ add_library(rexaudio OBJECT
     sdl/sdl_audio_system.cpp
     sdl/sdl_audio_driver.cpp
 )
+# XAudio2 backend (Windows; the one a UWP host such as Xbox One Dev Mode can use)
+if(WIN32)
+    target_sources(rexaudio PRIVATE xaudio2/xaudio2_audio_system.cpp)
+endif()
 add_library(rex::audio ALIAS rexaudio)
 
 rex_target_pch(rexaudio
@@ -39,3 +43,6 @@ target_link_libraries(rexaudio
     PUBLIC rexcore SDL3::SDL3
     PRIVATE libavcodec libavutil
 )
+if(WIN32)
+    target_link_libraries(rexaudio PUBLIC xaudio2)
+endif()
