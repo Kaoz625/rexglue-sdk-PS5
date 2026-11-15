@@ -298,8 +298,10 @@ bool Runtime::SetupVfs() {
     return true;
   }
 
-  // http://host:port/path = a disc image served with byte ranges (DiscImageDevice reads it).
-  bool game_root_is_url = game_data_root_.string().starts_with("http://");
+  // http://host:port/path = a disc image served with byte ranges; handle://N = a disc image file the host
+  // app already opened (Xbox: an ISO on the USB SSD). DiscImageDevice reads both.
+  bool game_root_is_url = game_data_root_.string().starts_with("http://") ||
+                          game_data_root_.string().starts_with("handle://");
   auto abs_game_root = game_root_is_url ? game_data_root_ : std::filesystem::absolute(game_data_root_);
   if (!game_root_is_url && !std::filesystem::exists(abs_game_root)) {
     REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());

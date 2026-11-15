@@ -220,7 +220,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   }
   // A folder of game files, a disc image (.iso), or an http:// URL of one; Runtime::SetupVfs
   // mounts each.
-  bool game_root_is_url = paths.game_data_root.string().starts_with("http://");
+  bool game_root_is_url = paths.game_data_root.string().starts_with("http://") ||
+                          paths.game_data_root.string().starts_with("handle://");
   if (!game_root_is_url && !std::filesystem::exists(paths.game_data_root)) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);

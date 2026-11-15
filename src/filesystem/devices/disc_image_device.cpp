@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -262,6 +263,63 @@ class HttpSource : public DiscSource {
   size_t size_ = 0;
 };
 
+// handle://<number>: a file the host app already opened (on the Xbox, the UWP shell opens an ISO on a USB drive
+// through StorageFolder + IStorageItemHandleAccess, since the console refuses plain opens there). Read with
+// positioned ReadFile calls, so the handle's own file pointer never matters. The device owns the handle.
+class HandleSource : public DiscSource {
+ public:
+  static std::unique_ptr<DiscSource> Open(const std::string& url) {
+#if REX_PLATFORM_WIN32
+    uint64_t value = std::strtoull(url.c_str() + 9, nullptr, 10);  // after "handle://"
+    HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
+    LARGE_INTEGER size;
+    if (!value || !GetFileSizeEx(handle, &size)) {
+      REXFS_ERROR("Disc handle {} is not an open file (error {})", value, GetLastError());
+      return nullptr;
+    }
+    auto source = std::make_unique<HandleSource>();
+    source->handle_ = handle;
+    source->size_ = static_cast<size_t>(size.QuadPart);
+    REXFS_INFO("Disc image from an open file handle, {} bytes", source->size_);
+    return source;
+#else
+    REXFS_ERROR("handle:// disc images are Windows only: {}", url);
+    return nullptr;
+#endif
+  }
+#if REX_PLATFORM_WIN32
+  ~HandleSource() override { CloseHandle(handle_); }
+#endif
+  size_t size() const override { return size_; }
+  bool ReadAt(size_t offset, void* buffer, size_t length) override {
+#if REX_PLATFORM_WIN32
+    auto* out = static_cast<uint8_t*>(buffer);
+    while (length) {
+      OVERLAPPED at = {};
+      at.Offset = static_cast<DWORD>(offset);
+      at.OffsetHigh = static_cast<DWORD>(static_cast<uint64_t>(offset) >> 32);
+      DWORD want = static_cast<DWORD>(std::min<size_t>(length, 64_MiB)), got = 0;
+      if (!ReadFile(handle_, out, want, &got, &at) || !got) {
+        REXFS_ERROR("Disc handle read at {} ({} bytes) failed, error {}", offset, want, GetLastError());
+        return false;
+      }
+      out += got;
+      offset += got;
+      length -= got;
+    }
+    return true;
+#else
+    return false;
+#endif
+  }
+
+ private:
+#if REX_PLATFORM_WIN32
+  HANDLE handle_ = nullptr;
+#endif
+  size_t size_ = 0;
+};
+
 }  // namespace
 
 DiscImageDevice::DiscImageDevice(const std::string_view mount_path,
@@ -272,7 +330,9 @@ DiscImageDevice::~DiscImageDevice() = default;  // here: DiscSource is complete 
 
 bool DiscImageDevice::Initialize() {
   auto host = host_path_.string();
-  source_ = host.starts_with("http://") ? HttpSource::Open(host) : FileSource::Open(host_path_);
+  source_ = host.starts_with("http://")     ? HttpSource::Open(host)
+            : host.starts_with("handle://") ? HandleSource::Open(host)
+                                            : FileSource::Open(host_path_);
   if (!source_) {
     REXFS_ERROR("Disc image could not be opened: {}", host);
     return false;
