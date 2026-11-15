@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <set>
+#include <tuple>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -21,6 +23,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/xenos.h>
+#include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
@@ -29,6 +32,11 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
                     "Execute unclipped draw VS on CPU with scissor");
+
+REXCVAR_DEFINE_INT32(draw_extent_log, 0, "GPU",
+                     "Log this many unclipped draws (PA_CL_CLIP_CNTL clip_disable) with the EDRAM height "
+                     "estimate: the vertex shader hash, draw initiator, viewport, the CPU vertex shader "
+                     "result against the viewport / scissor bounds (x360-native diagnostics)");
 
 // DEFINE_bool(
 //     execute_unclipped_draw_vs_on_cpu, true,
@@ -59,6 +67,19 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
 
 namespace rex::graphics {
 
+namespace {
+// draw_extent_log diagnostics: what the last EstimateVertexMaxY saw (x360-native).
+struct VertexMaxYDiag {
+  const char* bail = nullptr;  // why the vertex shader was not interpreted
+  uint32_t vertices = 0, killed = 0, no_position = 0, no_w = 0;
+  float min_y = FLT_MAX, max_y = -FLT_MAX;          // after the viewport transform
+  float min_raw_y = FLT_MAX, max_raw_y = -FLT_MAX;  // position.y as exported
+  float min_w = FLT_MAX, max_w = -FLT_MAX;
+  uint32_t result = 0;
+};
+VertexMaxYDiag g_vertex_max_y_diag;
+}  // namespace
+
 void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
                                                       const float* value, uint32_t value_mask) {
   if (export_register == ucode::ExportRegister::kVSPosition) {
@@ -83,13 +104,19 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
 
   const RegisterFile& regs = register_file_;
 
+  VertexMaxYDiag& diag = g_vertex_max_y_diag;
+  diag = VertexMaxYDiag();
+
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
   if (!vgt_draw_initiator.num_indices) {
+    diag.bail = "no indices";
     return 0;
   }
   if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
       vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
     // TODO(Triang3l): Support immediate indices.
+    diag.bail = "immediate indices";
+    diag.result = xenos::kTexture2DCubeMaxWidthHeight;
     return xenos::kTexture2DCubeMaxWidthHeight;
   }
 
@@ -97,12 +124,16 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
       regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
           xenos::VGTOutputPath::kTessellationEnable) {
+    diag.bail = "tessellation";
+    diag.result = xenos::kTexture2DCubeMaxWidthHeight;
     return xenos::kTexture2DCubeMaxWidthHeight;
   }
 
   assert_true(vertex_shader.type() == xenos::ShaderType::kVertex);
   assert_true(vertex_shader.is_ucode_analyzed());
   if (!ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    diag.bail = "texture fetch in VS";
+    diag.result = xenos::kTexture2DCubeMaxWidthHeight;
     return xenos::kTexture2DCubeMaxWidthHeight;
   }
 
@@ -189,22 +220,34 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
     shader_interpreter_.temp_registers()[0] = float(vertex_index);
     shader_interpreter_.Execute();
 
+    ++diag.vertices;
     if (position_y_export_sink.vertex_kill().has_value() &&
         (position_y_export_sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) {
+      ++diag.killed;
       continue;
     }
     if (!position_y_export_sink.position_y().has_value()) {
+      ++diag.no_position;
       continue;
     }
     float vertex_y = position_y_export_sink.position_y().value();
+    diag.min_raw_y = std::min(diag.min_raw_y, vertex_y);
+    diag.max_raw_y = std::max(diag.max_raw_y, vertex_y);
+    if (position_y_export_sink.position_w().has_value()) {
+      diag.min_w = std::min(diag.min_w, position_y_export_sink.position_w().value());
+      diag.max_w = std::max(diag.max_w, position_y_export_sink.position_w().value());
+    }
     if (!pa_cl_vte_cntl.vtx_xy_fmt) {
       if (!position_y_export_sink.position_w().has_value()) {
+        ++diag.no_w;
         continue;
       }
       vertex_y /= position_y_export_sink.position_w().value();
     }
 
     vertex_y = vertex_y * viewport_y_scale + viewport_y_offset;
+    diag.min_y = std::min(diag.min_y, vertex_y);
+    diag.max_y = std::max(diag.max_y, vertex_y);
 
     if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
       float point_radius_y;
@@ -245,9 +288,10 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   }
   // Top-left rule - .5 exclusive without MSAA, 1. exclusive with MSAA.
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
-  return (uint32_t(std::max(int32_t(0), max_y_24p8)) +
-          ((rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X) ? 127 : 255)) >>
-         8;
+  diag.result = (uint32_t(std::max(int32_t(0), max_y_24p8)) +
+                 ((rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X) ? 127 : 255)) >>
+                8;
+  return diag.result;
 }
 
 uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
@@ -272,6 +316,7 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
 
   if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
     // Actual extent from the vertices.
+    bool vertex_max_y_estimated = false;
     if (try_to_estimate_vertex_max_y && REXCVAR_GET(execute_unclipped_draw_vs_on_cpu)) {
       bool estimate_vertex_max_y;
       if (REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_with_scissor)) {
@@ -295,7 +340,53 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
       }
       if (estimate_vertex_max_y) {
         max_y = std::min(max_y, EstimateVertexMaxY(vertex_shader));
+        vertex_max_y_estimated = true;
       }
+    }
+    // Each distinct (vertex shader, primitive, estimate, scissor) once - the intro movie alone used up a plain
+    // first-N cap before the menu drew anything (30 Oct).
+    static int32_t unclipped_draws_logged = 0;
+    static std::set<std::tuple<uint64_t, uint32_t, uint32_t, int32_t>> logged_kinds;
+    if (unclipped_draws_logged < REXCVAR_GET(draw_extent_log) &&
+        logged_kinds
+            .emplace(vertex_shader.ucode_data_hash(),
+                     uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type), max_y, scissor_bottom)
+            .second) {
+      ++unclipped_draws_logged;
+      const VertexMaxYDiag& diag = g_vertex_max_y_diag;
+      auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+      auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+      // The viewport bound the clipped path would have used.
+      float viewport_bottom = 0.0f;
+      if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+        viewport_bottom += float(window_y_offset);
+      }
+      if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+        viewport_bottom += 0.5f;
+      }
+      if (pa_cl_vte_cntl.vport_y_offset_ena) {
+        viewport_bottom += regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+      }
+      viewport_bottom += pa_cl_vte_cntl.vport_y_scale_ena
+                             ? std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE))
+                             : 1.0f;
+      auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      REXSYS_INFO(
+          "draw extent #{}: vs {:016X} -> max_y {} (scissor {} viewport {:.1f}) | draw: {} idx src {} "
+          "prim {} isz {} | vte {:08X} vport x {:.1f}/{:.1f} y {:.1f}/{:.1f} win {},{} sc_mode {:08X} "
+          "clip {:08X} surf pitch {} msaa {} | vs on cpu: {}{} {} verts ({} killed, {} no pos, {} no w) "
+          "raw y {:.3f}..{:.3f} w {:.3f}..{:.3f} screen y {:.1f}..{:.1f} -> {}",
+          unclipped_draws_logged, vertex_shader.ucode_data_hash(), max_y, scissor_bottom,
+          viewport_bottom, uint32_t(vgt_draw_initiator.num_indices),
+          uint32_t(vgt_draw_initiator.source_select), uint32_t(vgt_draw_initiator.prim_type),
+          uint32_t(vgt_draw_initiator.index_size), regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE), regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE), regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+          int32_t(pa_sc_window_offset.window_x_offset), window_y_offset,
+          regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
+          uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+          vertex_max_y_estimated ? "" : "NOT RUN; last: ", diag.bail ? diag.bail : "ran", diag.vertices, diag.killed, diag.no_position, diag.no_w,
+          diag.min_raw_y, diag.max_raw_y, diag.min_w, diag.max_w, diag.min_y, diag.max_y, diag.result);
     }
   } else {
     // Viewport. Though the Xenos itself doesn't have an implicit viewport
