@@ -13,10 +13,12 @@
 #include <rex/filesystem/devices/disc_image_entry.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include <rex/platform.h>
 
@@ -114,11 +116,27 @@ class HttpSource : public DiscSource {
     size_t colon = authority.rfind(':');
     source->host_ = authority.substr(0, colon);
     source->port_ = colon == std::string::npos ? "80" : authority.substr(colon + 1);
-    if (!source->Request("HEAD", 0, 0, nullptr) || !source->size_) {
-      REXFS_ERROR("Disc image URL did not answer a HEAD request: {}", url);
-      return nullptr;
+    // A server whose disk is asleep answers the first request late or not at all (15 Nov 2026: mac1's 5TB took
+    // 6.9 s cold and the PS5 Army of Two title gave up on its one HEAD). Retry with a growing pause, ~50 s in all.
+    constexpr int kAttempts = 8;
+    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+      source->last_error_.clear();
+      if (source->Request("HEAD", 0, 0, nullptr) && source->size_) {
+        if (attempt > 1) {
+          REXFS_WARN("Disc image URL answered on attempt {}: {}", attempt, url);
+        }
+        return source;
+      }
+      REXFS_WARN("Disc image HEAD attempt {}/{} failed ({}): {}", attempt, kAttempts,
+                 source->last_error_.empty() ? "no size" : source->last_error_, url);
+      source->Disconnect();
+      source->pending_.clear();
+      if (attempt < kAttempts) {
+        std::this_thread::sleep_for(std::chrono::seconds(attempt < 4 ? 2 : 10));
+      }
     }
-    return source;
+    REXFS_ERROR("Disc image URL did not answer a HEAD request: {}", url);
+    return nullptr;
   }
   ~HttpSource() override { Disconnect(); }
 
@@ -166,6 +184,7 @@ class HttpSource : public DiscSource {
       timeval timeout{30, 0};
       setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
       if (connect(s, numeric.ai_addr, numeric.ai_addrlen) != 0) {
+        last_error_ = "connect errno " + std::to_string(errno);
         REXFS_ERROR("Disc image: connect {}:{} failed, errno {}", host_, port_, errno);
         CloseSocket(s);
         return false;
@@ -262,6 +281,7 @@ class HttpSource : public DiscSource {
       char buf[4096];
       int n = recv(sock_, buf, sizeof(buf), 0);
       if (n <= 0 || pending_.size() > 64 * 1024) {
+        last_error_ = n == 0 ? "connection closed" : n < 0 ? "recv errno " + std::to_string(errno) : "header too big";
         return false;
       }
       pending_.append(buf, n);
@@ -284,6 +304,7 @@ class HttpSource : public DiscSource {
     }
     if (std::string(method) == "HEAD") {
       size_ = content_length;
+      if (status != 200 && status != 206) last_error_ = "HTTP status " + std::to_string(status);
       return status == 200 || status == 206;
     }
     if (status != 206 || content_length != length) {
@@ -296,6 +317,7 @@ class HttpSource : public DiscSource {
   }
 
   std::string host_, port_, path_;
+  std::string last_error_;
   Socket sock_ = kNoSocket;
   std::string pending_;
   size_t size_ = 0;
