@@ -629,7 +629,35 @@ class TextureCache {
     for (RecentTexture& recent : recent_textures_) {
       recent.texture = nullptr;
     }
+    // The binding cache holds texture pointers too.
+    for (auto& slot_cache : fetch_binding_cache_) {
+      for (FetchBindingCacheEntry& entry : slot_cache) {
+        entry.valid = false;
+      }
+    }
   }
+
+  // Recently used bindings per fetch constant slot, by the raw fetch constant:
+  // games cycle each slot through a limited set of fetch constants (a few per
+  // material), so the binding info, host swizzle, signed-separate flag and the
+  // textures don't need to be derived and looked up again every time a slot's
+  // fetch constant changes. Texture pointers are looked up when first needed
+  // (null until then); cleared with the recent texture table when textures are
+  // destroyed.
+  struct FetchBindingCacheEntry {
+    uint32_t fetch[6];
+    bool valid = false;
+    bool signed_separate;
+    uint8_t swizzled_signs;
+    uint32_t host_swizzle;
+    TextureKey key;
+    Texture* texture;
+    Texture* texture_signed;
+  };
+  static constexpr uint32_t kFetchBindingCacheWays = 4;
+  std::array<std::array<FetchBindingCacheEntry, kFetchBindingCacheWays>, 32>
+      fetch_binding_cache_;
+  std::array<uint8_t, 32> fetch_binding_cache_next_{};
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

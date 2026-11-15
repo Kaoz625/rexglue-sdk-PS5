@@ -494,8 +494,23 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
-    BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    uint32_t old_host_swizzle = binding.host_swizzle;
     texture_bindings_in_sync_ |= index_bit;
+    // The cached binding for this fetch constant, or a new cache entry.
+    static_assert(sizeof(fetch) == sizeof(FetchBindingCacheEntry::fetch));
+    FetchBindingCacheEntry* cached = nullptr;
+    for (FetchBindingCacheEntry& entry : fetch_binding_cache_[index]) {
+      if (entry.valid && !std::memcmp(entry.fetch, &fetch, sizeof(entry.fetch))) {
+        cached = &entry;
+        break;
+      }
+    }
+    if (cached) {
+      binding.key = cached->key;
+      binding.swizzled_signs = cached->swizzled_signs;
+    } else {
+      BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    }
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
         bindings_changed |= index_bit;
@@ -503,8 +518,36 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       binding.Reset();
       continue;
     }
-    uint32_t old_host_swizzle = binding.host_swizzle;
-    binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    bool signed_separate;
+    if (cached) {
+      binding.host_swizzle = cached->host_swizzle;
+      signed_separate = cached->signed_separate;
+    } else {
+      binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+      signed_separate = IsSignedVersionSeparateForFormat(binding.key);
+      uint8_t& next_way = fetch_binding_cache_next_[index];
+      cached = &fetch_binding_cache_[index][next_way];
+      next_way = uint8_t((next_way + 1) % kFetchBindingCacheWays);
+      std::memcpy(cached->fetch, &fetch, sizeof(cached->fetch));
+      cached->valid = true;
+      cached->signed_separate = signed_separate;
+      cached->swizzled_signs = binding.swizzled_signs;
+      cached->host_swizzle = binding.host_swizzle;
+      cached->key = binding.key;
+      cached->texture = nullptr;
+      cached->texture_signed = nullptr;
+    }
+    auto find_texture = [&](bool is_signed) -> Texture* {
+      Texture*& cached_texture = is_signed ? cached->texture_signed : cached->texture;
+      if (!cached_texture) {
+        TextureKey texture_key = binding.key;
+        if (is_signed) {
+          texture_key.signed_separate = 1;
+        }
+        cached_texture = FindOrCreateTexture(texture_key);
+      }
+      return cached_texture;
+    };
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -520,7 +563,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       bindings_changed |= index_bit;
     }
     bool load_unsigned_data = false, load_signed_data = false;
-    if (IsSignedVersionSeparateForFormat(binding.key)) {
+    if (signed_separate) {
       // Can reuse previously loaded unsigned/signed versions if the key is the
       // same and the texture was previously bound as unsigned/signed
       // respectively (checking the previous values of signedness rather than
@@ -529,7 +572,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // load).
       if (any_sign_is_not_signed) {
         if (key_changed || !any_sign_was_not_signed) {
-          binding.texture = FindOrCreateTexture(binding.key);
+          binding.texture = find_texture(false);
           load_unsigned_data = true;
         }
       } else {
@@ -537,9 +580,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
       if (any_sign_is_signed) {
         if (key_changed || !any_sign_was_signed) {
-          TextureKey signed_key = binding.key;
-          signed_key.signed_separate = 1;
-          binding.texture_signed = FindOrCreateTexture(signed_key);
+          binding.texture_signed = find_texture(true);
           load_signed_data = true;
         }
       } else {
@@ -549,7 +590,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // Same resource for both unsigned and signed, but descriptor formats may
       // be different.
       if (key_changed) {
-        binding.texture = FindOrCreateTexture(binding.key);
+        binding.texture = find_texture(false);
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
